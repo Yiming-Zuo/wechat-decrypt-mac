@@ -15,12 +15,13 @@ print = functools.partial(print, flush=True)
 from crypto_params import PAGE_SZ, decrypt_page
 from config import load_config
 from session_parser import parse_session_info
-from msg_format import format_msg_type, format_summary
+from msg_format import format_msg_type, format_summary, resolve_sender_display
 
 _cfg = load_config()
 DB_DIR = _cfg["db_dir"]
 KEYS_FILE = _cfg["keys_file"]
 CONTACT_CACHE = os.path.join(_cfg["decrypted_dir"], "Contact", "wccontact_new2.db")
+GROUP_CACHE = os.path.join(_cfg["decrypted_dir"], "Group", "group_new.db")
 
 POLL_INTERVAL = 3  # 秒
 
@@ -73,6 +74,14 @@ def load_contact_names():
         conn.close()
     except Exception as e:
         print(f"[WARN] 加载联系人失败: {e}")
+    try:
+        conn = sqlite3.connect(GROUP_CACHE)
+        for uname, nick in conn.execute("SELECT m_nsUsrName, nickname FROM GroupMember").fetchall():
+            if uname not in names and nick:
+                names[uname] = nick
+        conn.close()
+    except Exception:
+        pass
     return names
 
 
@@ -92,7 +101,7 @@ def get_session_state(conn):
                 'timestamp': r[2],
                 'msg_type': info['msg_type'],
                 'sender': info['sender'],
-                'sender_name': '',
+                'mes_des': info.get('mes_des', -1),
                 'display_name': info.get('display_name', ''),
             }
     except Exception as e:
@@ -163,11 +172,12 @@ def main():
                     display = contact_names.get(username) or curr.get('display_name') or username
                     ts = datetime.fromtimestamp(curr['timestamp']).strftime('%H:%M:%S')
                     msg_type_label = format_msg_type(curr['msg_type'])
-                    sender = curr['sender_name'] or curr['sender'] or ''
+                    sender = resolve_sender_display(
+                        curr.get('mes_des', -1), username, curr['sender'], contact_names
+                    )
 
-                    if '@chatroom' in username and sender:
-                        sender_display = contact_names.get(curr['sender'], sender)
-                        print(f"[{ts}] [{display}] {sender_display}:")
+                    if sender:
+                        print(f"[{ts}] [{display}] {sender}:")
                     else:
                         print(f"[{ts}] [{display}]")
 

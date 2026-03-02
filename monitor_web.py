@@ -19,11 +19,12 @@ from crypto_params import (
 
 from config import load_config
 from session_parser import parse_session_info
-from msg_format import format_msg_type, format_summary
+from msg_format import format_msg_type, format_summary, resolve_sender_display
 _cfg = load_config()
 DB_DIR = _cfg["db_dir"]
 KEYS_FILE = _cfg["keys_file"]
 CONTACT_CACHE = os.path.join(_cfg["decrypted_dir"], "Contact", "wccontact_new2.db")
+GROUP_CACHE = os.path.join(_cfg["decrypted_dir"], "Group", "group_new.db")
 DECRYPTED_SESSION = os.path.join(_cfg["decrypted_dir"], "Session", "session_new.db")
 
 SESSION_KEY = "Session/session_new.db"
@@ -58,6 +59,14 @@ def load_contact_names():
         conn = sqlite3.connect(CONTACT_CACHE)
         for r in conn.execute("SELECT m_nsUsrName, nickname, m_nsRemark FROM WCContact").fetchall():
             names[r[0]] = r[2] if r[2] else r[1] if r[1] else r[0]
+        conn.close()
+    except Exception:
+        pass
+    try:
+        conn = sqlite3.connect(GROUP_CACHE)
+        for uname, nick in conn.execute("SELECT m_nsUsrName, nickname FROM GroupMember").fetchall():
+            if uname not in names and nick:
+                names[uname] = nick
         conn.close()
     except Exception:
         pass
@@ -108,7 +117,8 @@ class SessionMonitor:
                 info = parse_session_info(r[3])
                 state[r[0]] = {
                     'unread': r[1] or 0, 'summary': info['summary'], 'timestamp': r[2],
-                    'msg_type': info['msg_type'], 'sender': info['sender'], 'sender_name': '',
+                    'msg_type': info['msg_type'], 'sender': info['sender'],
+                    'mes_des': info.get('mes_des', -1),
                     'display_name': info.get('display_name', ''),
                 }
         except Exception:
@@ -152,9 +162,9 @@ class SessionMonitor:
             if prev and curr['timestamp'] > prev['timestamp']:
                 display = self.contact_names.get(username) or curr.get('display_name') or username
                 is_group = '@chatroom' in username
-                sender = ''
-                if is_group:
-                    sender = self.contact_names.get(curr['sender'], curr['sender_name'] or curr['sender'])
+                sender = resolve_sender_display(
+                    curr.get('mes_des', -1), username, curr['sender'], self.contact_names
+                )
 
                 summary = curr['summary']
                 if curr['msg_type'] != 1:

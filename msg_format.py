@@ -53,3 +53,25 @@ def format_summary(msg_type, summary):
     if msg_type == 10000:
         return summary or f"[{format_msg_type(msg_type)}]"
     return f"[{format_msg_type(msg_type)}]"
+
+
+def resolve_sender_display(mes_des, username, sender_wxid, contact_names):
+    """
+    根據消息方向返回發送人顯示名。
+    mes_des: 0=自己發, 1=對方發, -1=未知
+    username: 會話 username（私聊對象 / 群）
+    sender_wxid: 群聊時 content 前綴的 wxid（私聊為空）
+    contact_names: {wxid: display_name}
+    """
+    is_group = '@chatroom' in username
+    if is_group:
+        if mes_des == 0:
+            return '我'
+        if sender_wxid:
+            return contact_names.get(sender_wxid, sender_wxid)
+        return ''
+    if mes_des == 0:
+        return '我'
+    if mes_des == 1:
+        return contact_names.get(username, username)
+    return ''

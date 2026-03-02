@@ -11,7 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 from crypto_params import PAGE_SZ, full_decrypt, decrypt_wal, SQLITE_HDR, WAL_HEADER_SZ, WAL_FRAME_HEADER_SZ
 from session_parser import parse_session_info
-from msg_format import format_msg_type, format_summary
+from msg_format import format_msg_type, format_summary, resolve_sender_display
 
 # ============ 配置加载 ============
 from config import load_config
@@ -98,25 +98,43 @@ def _load_contacts_from(db_path):
     return names, full
 
 
+def _merge_group_members(names):
+    """將 GroupMember 暱稱合併進 names（WCContact 優先，不覆蓋）"""
+    pre_decrypted = os.path.join(DECRYPTED_DIR, "Group", "group_new.db")
+    group_db = pre_decrypted if os.path.exists(pre_decrypted) else _cache.get("Group/group_new.db")
+    if not group_db:
+        return
+    try:
+        conn = sqlite3.connect(group_db)
+        for uname, nick in conn.execute("SELECT m_nsUsrName, nickname FROM GroupMember").fetchall():
+            if uname not in names and nick:
+                names[uname] = nick
+        conn.close()
+    except Exception:
+        pass
+
+
 def get_contact_names():
     global _contact_names, _contact_full
     if _contact_names is not None:
         return _contact_names
 
-    # 优先用已解密的 wccontact_new2.db
+    # 優先用已解密的 wccontact_new2.db
     pre_decrypted = os.path.join(DECRYPTED_DIR, "Contact", "wccontact_new2.db")
     if os.path.exists(pre_decrypted):
         try:
             _contact_names, _contact_full = _load_contacts_from(pre_decrypted)
+            _merge_group_members(_contact_names)
             return _contact_names
         except Exception:
             pass
 
-    # 实时解密
+    # 實時解密
     path = _cache.get("Contact/wccontact_new2.db")
     if path:
         try:
             _contact_names, _contact_full = _load_contacts_from(path)
+            _merge_group_members(_contact_names)
             return _contact_names
         except Exception:
             pass
@@ -249,7 +267,7 @@ def get_recent_sessions(limit: int = 20) -> str:
     """
     path = _cache.get("Session/session_new.db")
     if not path:
-        return "错误: 无法解密 session_new.db"
+        return json.dumps({"error": "无法解密 session_new.db"}, ensure_ascii=False)
 
     names = get_contact_names()
     conn = sqlite3.connect(path)
@@ -262,35 +280,23 @@ def get_recent_sessions(limit: int = 20) -> str:
     """, (limit,)).fetchall()
     conn.close()
 
-    results = []
+    sessions = []
     for r in rows:
         username, unread, ts, blob = r
         info = parse_session_info(blob)
-        msg_type = info['msg_type']
-        sender = info['sender']
-        summary = info['summary']
         display = names.get(username) or info.get('display_name') or username
         is_group = '@chatroom' in username
-
-        sender_display = ''
-        if is_group and sender:
-            sender_display = names.get(sender, sender)
-
-        time_str = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
-
-        entry = f"[{time_str}] {display}"
-        if is_group:
-            entry += " [群]"
-        if unread and unread > 0:
-            entry += f" ({unread}条未读)"
-        entry += f"\n  {format_msg_type(msg_type)}: "
-        if sender_display:
-            entry += f"{sender_display}: "
-        entry += format_summary(msg_type, summary) or "(无内容)"
-
-        results.append(entry)
-
-    return f"最近 {len(results)} 个会话:\n\n" + "\n\n".join(results)
+        sender_display = resolve_sender_display(info.get('mes_des', -1), username, info['sender'], names)
+        sessions.append({
+            "username": username, "display": display, "is_group": is_group,
+            "unread": unread or 0,
+            "time": datetime.fromtimestamp(ts).strftime('%m-%d %H:%M'),
+            "timestamp": ts,
+            "type": format_msg_type(info['msg_type']),
+            "sender": sender_display,
+            "content": format_summary(info['msg_type'], info['summary']) or "",
+        })
+    return json.dumps({"count": len(sessions), "sessions": sessions}, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -303,7 +309,7 @@ def get_chat_history(chat_name: str, limit: int = 50) -> str:
     """
     username = resolve_username(chat_name)
     if not username:
-        return f"找不到聊天对象: {chat_name}\n提示: 可以用 get_contacts(query='{chat_name}') 搜索联系人"
+        return json.dumps({"error": f"找不到聊天对象: {chat_name}"}, ensure_ascii=False)
 
     names = get_contact_names()
     display_name = names.get(username, username)
@@ -311,26 +317,26 @@ def get_chat_history(chat_name: str, limit: int = 50) -> str:
 
     db_path, table_name = _find_msg_table_for_user(username)
     if not db_path:
-        return f"找不到 {display_name} 的消息记录（可能在未解密的DB中或无消息）"
+        return json.dumps({"username": username, "display": display_name, "count": 0, "messages": [], "error": "找不到消息记录"}, ensure_ascii=False)
 
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(f"""
-            SELECT messageType, msgCreateTime, msgContent
+            SELECT messageType, msgCreateTime, msgContent, mesDes
             FROM [{table_name}]
             ORDER BY msgCreateTime DESC
             LIMIT ?
         """, (limit,)).fetchall()
     except Exception as e:
         conn.close()
-        return f"查询失败: {e}"
+        return json.dumps({"error": f"查询失败: {e}"}, ensure_ascii=False)
     conn.close()
 
     if not rows:
-        return f"{display_name} 无消息记录"
+        return json.dumps({"username": username, "display": display_name, "count": 0, "messages": []}, ensure_ascii=False)
 
-    lines = []
-    for local_type, create_time, content in reversed(rows):
+    messages = []
+    for local_type, create_time, content, mes_des in reversed(rows):
         time_str = datetime.fromtimestamp(create_time).strftime('%m-%d %H:%M')
         sender, text = _parse_message_content(content, local_type, is_group)
 
@@ -340,16 +346,17 @@ def get_chat_history(chat_name: str, limit: int = 50) -> str:
         if text and len(text) > 500:
             text = text[:500] + "..."
 
-        if is_group and sender:
-            sender_name = names.get(sender, sender)
-            lines.append(f"[{time_str}] {sender_name}: {text}")
-        else:
-            lines.append(f"[{time_str}] {text}")
+        sender_label = resolve_sender_display(mes_des, username, sender, names)
+        messages.append({
+            "time": time_str, "sender": sender_label,
+            "type": format_msg_type(local_type), "content": text,
+        })
 
-    header = f"{display_name} 的最近 {len(lines)} 条消息"
-    if is_group:
-        header += " [群聊]"
-    return header + ":\n\n" + "\n".join(lines)
+    return json.dumps({
+        "username": username, "display": display_name, "is_group": is_group,
+        "count": len(messages), "limit": limit, "has_more": len(rows) == limit,
+        "messages": messages,
+    }, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -361,7 +368,7 @@ def search_messages(keyword: str, limit: int = 20) -> str:
         limit: 返回的结果数量，默认20
     """
     if not keyword or len(keyword) < 1:
-        return "请提供搜索关键词"
+        return json.dumps({"error": "请提供搜索关键词"}, ensure_ascii=False)
 
     names = get_contact_names()
     results = []
@@ -376,12 +383,10 @@ def search_messages(keyword: str, limit: int = 20) -> str:
 
         conn = sqlite3.connect(path)
         try:
-            # 获取所有 Chat_ 表
             tables = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'"
             ).fetchall()
 
-            # 获取 Name2Id 映射（hash -> username 反查）
             name2id = {}
             try:
                 for r in conn.execute("SELECT user_name FROM Name2Id").fetchall():
@@ -399,7 +404,7 @@ def search_messages(keyword: str, limit: int = 20) -> str:
 
                 try:
                     rows = conn.execute(f"""
-                        SELECT messageType, msgCreateTime, msgContent
+                        SELECT messageType, msgCreateTime, msgContent, mesDes
                         FROM [{tname}]
                         WHERE msgContent LIKE ?
                         ORDER BY msgCreateTime DESC
@@ -408,32 +413,28 @@ def search_messages(keyword: str, limit: int = 20) -> str:
                 except Exception:
                     continue
 
-                for local_type, ts, content in rows:
+                for local_type, ts, content, mes_des in rows:
                     sender, text = _parse_message_content(content, local_type, is_group)
                     if local_type != 1:
                         text = format_summary(local_type, text)
+                    if text and len(text) > 300:
+                        text = text[:300] + "..."
                     time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
-                    sender_name = ''
-                    if is_group and sender:
-                        sender_name = names.get(sender, sender)
-
-                    entry = f"[{time_str}] [{display}]"
-                    if sender_name:
-                        entry += f" {sender_name}:"
-                    entry += f" {text}"
-                    if len(entry) > 300:
-                        entry = entry[:300] + "..."
-                    results.append((ts, entry))
+                    sender_label = resolve_sender_display(mes_des, username, sender, names)
+                    results.append((ts, {
+                        "time": time_str, "chat": display, "username": username,
+                        "sender": sender_label, "content": text,
+                    }))
         finally:
             conn.close()
 
     results.sort(key=lambda x: x[0], reverse=True)
     entries = [r[1] for r in results[:limit]]
 
-    if not entries:
-        return f"未找到包含 \"{keyword}\" 的消息"
-
-    return f"搜索 \"{keyword}\" 找到 {len(entries)} 条结果:\n\n" + "\n\n".join(entries)
+    return json.dumps({
+        "keyword": keyword, "count": len(entries), "limit": limit,
+        "has_more": len(entries) == limit, "results": entries,
+    }, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -446,7 +447,7 @@ def get_contacts(query: str = "", limit: int = 50) -> str:
     """
     contacts = get_contact_full()
     if not contacts:
-        return "错误: 无法加载联系人数据"
+        return json.dumps({"error": "无法加载联系人数据"}, ensure_ascii=False)
 
     if query:
         q = query.lower()
@@ -461,22 +462,10 @@ def get_contacts(query: str = "", limit: int = 50) -> str:
 
     filtered = filtered[:limit]
 
-    if not filtered:
-        return f"未找到匹配 \"{query}\" 的联系人"
-
-    lines = []
-    for c in filtered:
-        line = c['username']
-        if c['remark']:
-            line += f"  备注: {c['remark']}"
-        if c['nick_name']:
-            line += f"  昵称: {c['nick_name']}"
-        lines.append(line)
-
-    header = f"找到 {len(filtered)} 个联系人"
-    if query:
-        header += f"（搜索: {query}）"
-    return header + ":\n\n" + "\n".join(lines)
+    return json.dumps({
+        "query": query, "count": len(filtered),
+        "contacts": [{"username": c["username"], "nick_name": c["nick_name"], "remark": c["remark"]} for c in filtered],
+    }, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -486,7 +475,7 @@ def get_new_messages() -> str:
 
     path = _cache.get("Session/session_new.db")
     if not path:
-        return "错误: 无法解密 session_new.db"
+        return json.dumps({"error": "无法解密 session_new.db"}, ensure_ascii=False)
 
     names = get_contact_names()
     conn = sqlite3.connect(path)
@@ -505,55 +494,47 @@ def get_new_messages() -> str:
         curr_state[username] = {
             'unread': unread or 0, 'summary': info['summary'], 'timestamp': ts,
             'msg_type': info['msg_type'], 'sender': info['sender'],
+            'mes_des': info.get('mes_des', -1),
             'display_name': info.get('display_name', ''),
         }
 
     if not _last_check_state:
         _last_check_state = {u: s['timestamp'] for u, s in curr_state.items()}
-        # 首次调用，返回有未读的会话
-        unread_msgs = []
+        unread_list = []
         for username, s in curr_state.items():
             if s['unread'] and s['unread'] > 0:
                 display = names.get(username) or s.get('display_name') or username
-                is_group = '@chatroom' in username
-                time_str = datetime.fromtimestamp(s['timestamp']).strftime('%H:%M')
-                tag = "[群]" if is_group else ""
-                unread_msgs.append(f"[{time_str}] {display}{tag} ({s['unread']}条未读): {format_summary(s['msg_type'], s['summary'])}")
+                unread_list.append({
+                    "username": username, "display": display,
+                    "is_group": '@chatroom' in username,
+                    "unread": s['unread'],
+                    "time": datetime.fromtimestamp(s['timestamp']).strftime('%H:%M'),
+                    "type": format_msg_type(s['msg_type']),
+                    "content": format_summary(s['msg_type'], s['summary']),
+                })
+        return json.dumps({"first_call": True, "count": len(unread_list), "unread": unread_list}, ensure_ascii=False)
 
-        if unread_msgs:
-            return f"当前 {len(unread_msgs)} 个未读会话:\n\n" + "\n".join(unread_msgs)
-        return "当前无未读消息（已记录状态，下次调用将返回新消息）"
-
-    # 对比上次状态
     new_msgs = []
     for username, s in curr_state.items():
         prev_ts = _last_check_state.get(username, 0)
         if s['timestamp'] > prev_ts:
             display = names.get(username) or s.get('display_name') or username
-            is_group = '@chatroom' in username
-
-            sender_display = ''
-            if is_group and s['sender']:
-                sender_display = names.get(s['sender'], s['sender'])
-
-            time_str = datetime.fromtimestamp(s['timestamp']).strftime('%H:%M:%S')
-            entry = f"[{time_str}] {display}"
-            if is_group:
-                entry += " [群]"
-            entry += f": {format_msg_type(s['msg_type'])}"
-            if sender_display:
-                entry += f" ({sender_display})"
-            entry += f" - {format_summary(s['msg_type'], s['summary'])}"
-            new_msgs.append((s['timestamp'], entry))
+            sender_display = resolve_sender_display(s.get('mes_des', -1), username, s['sender'], names)
+            new_msgs.append((s['timestamp'], {
+                "username": username, "display": display,
+                "is_group": '@chatroom' in username,
+                "time": datetime.fromtimestamp(s['timestamp']).strftime('%H:%M:%S'),
+                "timestamp": s['timestamp'],
+                "type": format_msg_type(s['msg_type']),
+                "sender": sender_display,
+                "content": format_summary(s['msg_type'], s['summary']),
+            }))
 
     _last_check_state = {u: s['timestamp'] for u, s in curr_state.items()}
 
-    if not new_msgs:
-        return "无新消息"
-
     new_msgs.sort(key=lambda x: x[0])
     entries = [m[1] for m in new_msgs]
-    return f"{len(entries)} 条新消息:\n\n" + "\n".join(entries)
+    return json.dumps({"first_call": False, "count": len(entries), "messages": entries}, ensure_ascii=False)
 
 
 if __name__ == "__main__":

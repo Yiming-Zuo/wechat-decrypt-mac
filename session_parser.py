@@ -55,7 +55,7 @@ def parse_session_info(blob):
         sub 4 (string): content (群聊格式 "wxid:\n正文")
         sub 7 (varint): messageType (标准微信消息类型: 1/3/34/49/10000 等)
     """
-    result = {'summary': '', 'msg_type': 0, 'sender': '', 'display_name': '', 'remark': ''}
+    result = {'summary': '', 'msg_type': 0, 'sender': '', 'display_name': '', 'remark': '', 'mes_des': -1}
     if not blob or isinstance(blob, str):
         return result
 
@@ -86,6 +86,12 @@ def parse_session_info(blob):
             for v in msg.get(7, []):
                 if isinstance(v, int):
                     result['msg_type'] = v
+            for v in msg.get(6, []):
+                if isinstance(v, int):
+                    if v == 2:
+                        result['mes_des'] = 0   # 自己發
+                    elif v == 1:
+                        result['mes_des'] = 1   # 對方發
             for v in msg.get(4, []):
                 if isinstance(v, (bytes, bytearray)):
                     content = v.decode('utf-8', errors='replace')
