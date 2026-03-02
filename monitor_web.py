@@ -342,7 +342,7 @@ function addMsg(m, animate){
   const ur=m.unread>0?`<span class="msg-unread">${m.unread}</span>`:'';
   const cc=m.is_group?'msg-chat grp':'msg-chat';
 
-  d.innerHTML=`<div class="msg-header"><span class="msg-time">${m.time}</span><span class="${cc}">${esc(m.chat)}</span>${sn}<div class="msg-r"><span class="msg-type">${m.type_icon} ${m.type}</span>${ur}</div></div><div class="msg-content">${esc(m.content||'')}</div>`;
+  d.innerHTML=`<div class="msg-header"><span class="msg-time">${m.time}</span><span class="${cc}">${esc(m.chat)}</span>${sn}<div class="msg-r"><span class="msg-type">${m.type}</span>${ur}</div></div><div class="msg-content">${esc(m.content||'')}</div>`;
 
   M.insertBefore(d, M.firstChild);
 

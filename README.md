@@ -111,13 +111,13 @@ claude mcp add wechat -- python /path/to/wechat-decrypt/mcp_server.py
 
 注册后在 Claude Code 中即可使用以下工具：
 
-| Tool | 功能 |
-|------|------|
-| `get_recent_sessions(limit)` | 最近会话列表（含消息摘要、未读数） |
-| `get_chat_history(chat_name, limit)` | 指定聊天的消息记录（支持模糊匹配名字） |
-| `search_messages(keyword, limit)` | 全库搜索消息内容 |
-| `get_contacts(query, limit)` | 搜索/列出联系人 |
-| `get_new_messages()` | 获取自上次调用以来的新消息 |
+| Tool | 功能 | 来源 ｜
+|------|------|------|
+| `get_recent_sessions(limit)` | 最近会话列表，每个会话的最新一条消息（含消息摘要、未读数） | session_new.db + WAL |
+| `get_chat_history(chat_name, limit)` | 指定聊天的消息记录（支持模糊匹配名字） | msg_x.db + WAL |
+| `search_messages(keyword, limit)` | 全库搜索消息内容 | msg0-9 + WAL |
+| `get_contacts(query, limit)` | 搜索/列出联系人 | wccontact_new2.db |
+| `get_new_messages()` | 获取自上次调用以来的新消息 | session_new.db + WAL |
 
 前置条件：需要先完成步骤 1-2（配置 + 提取密钥）。
 
