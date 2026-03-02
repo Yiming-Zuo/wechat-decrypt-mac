@@ -334,6 +334,60 @@ def _parse_message_content(content, local_type, is_group):
     return sender, text
 
 
+_TIME_FORMATS = [
+    ('%Y-%m-%d %H:%M:%S', False),
+    ('%Y-%m-%d %H:%M', False),
+    ('%Y-%m-%d', True),
+]
+
+
+def _parse_time_arg(value, is_end):
+    """解析时间参数，返回 (timestamp, normalized_string)。空字符串返回 (None, None)。"""
+    if not value:
+        return None, None
+
+    for fmt, date_only in _TIME_FORMATS:
+        try:
+            dt = datetime.strptime(value, fmt)
+            if date_only:
+                dt = dt.replace(hour=23, minute=59, second=59) if is_end else dt.replace(
+                    hour=0, minute=0, second=0
+                )
+            return int(dt.timestamp()), dt.strftime('%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            continue
+
+    raise ValueError
+
+
+def _resolve_time_range(start_time, end_time):
+    start_ts = end_ts = None
+    normalized_start = normalized_end = None
+
+    if start_time:
+        try:
+            start_ts, normalized_start = _parse_time_arg(start_time, is_end=False)
+        except ValueError:
+            return None, None, None, json.dumps({"error": "时间格式错误: start_time"}, ensure_ascii=False)
+
+    if end_time:
+        try:
+            end_ts, normalized_end = _parse_time_arg(end_time, is_end=True)
+        except ValueError:
+            return None, None, None, json.dumps({"error": "时间格式错误: end_time"}, ensure_ascii=False)
+
+    if start_ts is not None and end_ts is not None and start_ts > end_ts:
+        return None, None, None, json.dumps({"error": "start_time 不能晚于 end_time"}, ensure_ascii=False)
+
+    if start_ts is None and end_ts is None:
+        return None, None, None, None
+
+    return start_ts, end_ts, {
+        "start_time": normalized_start,
+        "end_time": normalized_end,
+    }, None
+
+
 # ============ MCP Server ============
 
 mcp = FastMCP("wechat", instructions="查询微信消息、联系人等数据")
@@ -386,13 +440,22 @@ def get_recent_sessions(limit: int = 20) -> str:
 
 
 @mcp.tool()
-def get_chat_history(chat_name: str, limit: int = 50) -> str:
+def get_chat_history(chat_name: str, limit: int = 50, start_time: str = "", end_time: str = "") -> str:
     """获取指定聊天的消息记录。
 
     Args:
         chat_name: 聊天对象的名字、备注名或wxid，自动模糊匹配
         limit: 返回的消息数量，默认50
+        start_time: 起始时间，支持 YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DD HH:MM:SS
+        end_time: 结束时间，支持 YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DD HH:MM:SS
     """
+    if limit <= 0:
+        return json.dumps({"error": "limit 必须大于 0"}, ensure_ascii=False)
+
+    start_ts, end_ts, time_filter, error = _resolve_time_range(start_time, end_time)
+    if error:
+        return error
+
     username = resolve_username(chat_name)
     if not username:
         return json.dumps({"error": f"找不到聊天对象: {chat_name}"}, ensure_ascii=False)
@@ -403,22 +466,43 @@ def get_chat_history(chat_name: str, limit: int = 50) -> str:
 
     db_path, table_name = _find_msg_table_for_user(username)
     if not db_path:
-        return json.dumps({"username": username, "display": display_name, "count": 0, "messages": [], "error": "找不到消息记录"}, ensure_ascii=False)
+        return json.dumps({
+            "username": username, "display": display_name, "count": 0,
+            "messages": [], "time_filter": time_filter, "error": "找不到消息记录"
+        }, ensure_ascii=False)
 
     try:
+        where_clauses = ["1=1"]
+        params = []
+        if start_ts is not None:
+            where_clauses.append("msgCreateTime >= ?")
+            params.append(start_ts)
+        if end_ts is not None:
+            where_clauses.append("msgCreateTime <= ?")
+            params.append(end_ts)
+        params.append(limit + 1)
+
         with contextlib.closing(sqlite3.connect(db_path)) as conn:
             rows = conn.execute(f"""
                 SELECT messageType, msgCreateTime, msgContent, mesDes
                 FROM [{table_name}]
+                WHERE {' AND '.join(where_clauses)}
                 ORDER BY msgCreateTime DESC
                 LIMIT ?
-            """, (limit,)).fetchall()
+            """, params).fetchall()
     except Exception as e:
         logger.error("查询消息失败: %s", table_name, exc_info=True)
         return json.dumps({"error": f"查询失败: {e}"}, ensure_ascii=False)
 
+    has_more = len(rows) > limit
+    if has_more:
+        rows = rows[:limit]
+
     if not rows:
-        return json.dumps({"username": username, "display": display_name, "count": 0, "messages": []}, ensure_ascii=False)
+        return json.dumps({
+            "username": username, "display": display_name, "count": 0,
+            "messages": [], "time_filter": time_filter,
+        }, ensure_ascii=False)
 
     messages = []
     for local_type, create_time, content, mes_des in reversed(rows):
@@ -439,21 +523,30 @@ def get_chat_history(chat_name: str, limit: int = 50) -> str:
 
     return json.dumps({
         "username": username, "display": display_name, "is_group": is_group,
-        "count": len(messages), "limit": limit, "has_more": len(rows) == limit,
+        "count": len(messages), "limit": limit, "has_more": has_more,
+        "time_filter": time_filter,
         "messages": messages,
     }, ensure_ascii=False)
 
 
 @mcp.tool()
-def search_messages(keyword: str, limit: int = 20) -> str:
+def search_messages(keyword: str, limit: int = 20, start_time: str = "", end_time: str = "") -> str:
     """在所有聊天记录中搜索包含关键词的消息。
 
     Args:
         keyword: 搜索关键词
         limit: 返回的结果数量，默认20
+        start_time: 起始时间，支持 YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DD HH:MM:SS
+        end_time: 结束时间，支持 YYYY-MM-DD / YYYY-MM-DD HH:MM / YYYY-MM-DD HH:MM:SS
     """
     if not keyword:
         return json.dumps({"error": "请提供搜索关键词"}, ensure_ascii=False)
+    if limit <= 0:
+        return json.dumps({"error": "limit 必须大于 0"}, ensure_ascii=False)
+
+    start_ts, end_ts, time_filter, error = _resolve_time_range(start_time, end_time)
+    if error:
+        return error
 
     names = get_contact_names()
     hash2u = _build_hash2username()
@@ -465,7 +558,7 @@ def search_messages(keyword: str, limit: int = 20) -> str:
     for tname, rel_key in index.items():
         rel_to_tables.setdefault(rel_key, []).append(tname)
 
-    per_table_limit = max(5, limit)
+    per_table_limit = max(20, limit + 1)
 
     for rel_key, tables in rel_to_tables.items():
         path = _cache.get(rel_key)
@@ -478,13 +571,23 @@ def search_messages(keyword: str, limit: int = 20) -> str:
                     is_group = '@chatroom' in username
                     display = names.get(username) or _get_session_names().get(username) or username if username else tname
                     try:
+                        where_clauses = ["typeof(msgContent) = 'text'", "msgContent LIKE ?"]
+                        params = [f'%{keyword}%']
+                        if start_ts is not None:
+                            where_clauses.append("msgCreateTime >= ?")
+                            params.append(start_ts)
+                        if end_ts is not None:
+                            where_clauses.append("msgCreateTime <= ?")
+                            params.append(end_ts)
+                        params.append(per_table_limit)
+
                         rows = conn.execute(f"""
                             SELECT messageType, msgCreateTime, msgContent, mesDes
                             FROM [{tname}]
-                            WHERE typeof(msgContent) = 'text' AND msgContent LIKE ?
+                            WHERE {' AND '.join(where_clauses)}
                             ORDER BY msgCreateTime DESC
                             LIMIT ?
-                        """, (f'%{keyword}%', per_table_limit)).fetchall()
+                        """, params).fetchall()
                     except Exception:
                         logger.warning("搜索表失败: %s", tname, exc_info=True)
                         continue
@@ -506,11 +609,12 @@ def search_messages(keyword: str, limit: int = 20) -> str:
             logger.warning("打开消息 DB 失败: %s", rel_key, exc_info=True)
 
     results.sort(key=lambda x: x[0], reverse=True)
+    has_more = len(results) > limit
     entries = [r[1] for r in results[:limit]]
 
     return json.dumps({
         "keyword": keyword, "count": len(entries), "limit": limit,
-        "has_more": len(entries) == limit, "results": entries,
+        "has_more": has_more, "time_filter": time_filter, "results": entries,
     }, ensure_ascii=False)
 
 

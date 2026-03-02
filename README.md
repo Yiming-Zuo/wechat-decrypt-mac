@@ -114,12 +114,19 @@ claude mcp add wechat -- python /path/to/wechat-decrypt/mcp_server.py
 | Tool | 功能 | 来源 ｜
 |------|------|------|
 | `get_recent_sessions(limit)` | 最近会话列表，每个会话的最新一条消息（含消息摘要、未读数） | session_new.db + WAL |
-| `get_chat_history(chat_name, limit)` | 指定聊天的消息记录（支持模糊匹配名字） | msg_x.db + WAL |
-| `search_messages(keyword, limit)` | 全库搜索消息内容 | msg0-9 + WAL |
+| `get_chat_history(chat_name, limit, start_time, end_time)` | 指定聊天的消息记录（支持模糊匹配名字和按时间范围过滤） | msg_x.db + WAL |
+| `search_messages(keyword, limit, start_time, end_time)` | 全库搜索消息内容（支持按时间范围过滤） | msg0-9 + WAL |
 | `get_contacts(query, limit)` | 搜索/列出联系人 | wccontact_new2.db |
 | `get_new_messages()` | 获取自上次调用以来的新消息 | session_new.db + WAL |
 
 前置条件：需要先完成步骤 1-2（配置 + 提取密钥）。
+
+时间过滤参数说明：
+
+- `start_time` / `end_time` 都是可选参数
+- 支持格式：`YYYY-MM-DD`、`YYYY-MM-DD HH:MM`、`YYYY-MM-DD HH:MM:SS`
+- `YYYY-MM-DD` 会自动扩展到当天开始或结束时间
+- 推荐让模型把“最近一周”“最近一月”这类自然语言转换成具体日期后再调用 MCP 方法
 
 ## 文件说明
 
