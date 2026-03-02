@@ -419,7 +419,7 @@ def search_messages(keyword: str, limit: int = 20) -> str:
             for (tname,) in tables:
                 username = hash2u.get(tname, '')
                 is_group = '@chatroom' in username
-                display = names.get(username, username) if username else tname
+                display = names.get(username) or _get_session_names().get(username) or username if username else tname
 
                 try:
                     rows = conn.execute(f"""
@@ -442,6 +442,7 @@ def search_messages(keyword: str, limit: int = 20) -> str:
                     sender_label = resolve_sender_display(mes_des, username, sender, names)
                     results.append((ts, {
                         "time": time_str, "chat": display, "username": username,
+                        "is_group": is_group,
                         "sender": sender_label, "content": text,
                     }))
         finally:
