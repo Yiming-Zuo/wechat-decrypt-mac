@@ -11,6 +11,7 @@ from mcp.server.fastmcp import FastMCP
 
 from crypto_params import PAGE_SZ, full_decrypt, decrypt_wal, SQLITE_HDR, WAL_HEADER_SZ, WAL_FRAME_HEADER_SZ
 from session_parser import parse_session_info
+from msg_format import format_msg_type, format_summary
 
 # ============ 配置加载 ============
 from config import load_config
@@ -132,14 +133,6 @@ def get_contact_full():
 
 # ============ 辅助函数 ============
 
-def format_msg_type(t):
-    return {
-        1: '文本', 3: '图片', 34: '语音', 42: '名片',
-        43: '视频', 47: '表情', 48: '位置', 49: '链接/文件',
-        50: '通话', 62: '短视频', 10000: '系统', 10002: '撤回',
-    }.get(t, f'type={t}')
-
-
 def _get_session_names():
     global _session_names
     if _session_names is not None:
@@ -187,27 +180,6 @@ def resolve_username(chat_name):
             return uname
 
     return None
-
-
-def _extract_link_title(text):
-    """从 type=49 的 XML 内容中提取 <title> 标签值"""
-    if not text:
-        return ''
-    m = re.search(r'<title[^>]*>(.*?)</title>', text, re.DOTALL)
-    return m.group(1).strip() if m else ''
-
-
-def format_summary(msg_type, summary):
-    """根据消息类型格式化摘要，非文本消息替换为类型标签"""
-    if msg_type == 1:
-        return summary or ''
-    type_label = format_msg_type(msg_type)
-    if msg_type == 49:
-        title = _extract_link_title(summary)
-        return f"[{type_label}] {title}" if title else f"[{type_label}]"
-    if msg_type == 10000:
-        return summary or f"[{type_label}]"
-    return f"[{type_label}]"
 
 
 def _parse_message_content(content, local_type, is_group):

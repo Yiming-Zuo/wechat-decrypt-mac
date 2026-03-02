@@ -19,6 +19,7 @@ from crypto_params import (
 
 from config import load_config
 from session_parser import parse_session_info
+from msg_format import format_msg_type, format_summary
 _cfg = load_config()
 DB_DIR = _cfg["db_dir"]
 KEYS_FILE = _cfg["keys_file"]
@@ -61,14 +62,6 @@ def load_contact_names():
     except Exception:
         pass
     return names
-
-
-def format_msg_type(t):
-    return {
-        1: '文本', 3: '图片', 34: '语音', 42: '名片',
-        43: '视频', 47: '表情', 48: '位置', 49: '链接/文件',
-        50: '通话', 62: '短视频', 10000: '系统', 10002: '撤回',
-    }.get(t, f'type={t}')
 
 
 def msg_type_icon(t):
@@ -164,8 +157,8 @@ class SessionMonitor:
                     sender = self.contact_names.get(curr['sender'], curr['sender_name'] or curr['sender'])
 
                 summary = curr['summary']
-                if curr['msg_type'] not in (1, 49, 10000):
-                    summary = f"[{format_msg_type(curr['msg_type'])}]"
+                if curr['msg_type'] != 1:
+                    summary = format_summary(curr['msg_type'], summary)
 
                 new_msgs.append({
                     'time': datetime.fromtimestamp(curr['timestamp']).strftime('%H:%M:%S'),

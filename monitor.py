@@ -15,6 +15,7 @@ print = functools.partial(print, flush=True)
 from crypto_params import PAGE_SZ, decrypt_page
 from config import load_config
 from session_parser import parse_session_info
+from msg_format import format_msg_type, format_summary
 
 _cfg = load_config()
 DB_DIR = _cfg["db_dir"]
@@ -99,14 +100,6 @@ def get_session_state(conn):
     return state
 
 
-def format_msg_type(t):
-    return {
-        1: '文本', 3: '图片', 34: '语音', 42: '名片',
-        43: '视频', 47: '表情', 48: '位置', 49: '链接/文件',
-        50: '通话', 62: '短视频', 10000: '系统', 10002: '撤回',
-    }.get(t, f'type={t}')
-
-
 def main():
     print("=" * 60)
     print("  微信实时消息监听器 (macOS)")
@@ -160,22 +153,16 @@ def main():
                 if prev is None:
                     display = contact_names.get(username) or curr.get('display_name') or username
                     ts = datetime.fromtimestamp(curr['timestamp']).strftime('%H:%M:%S')
-                    msg_type = curr['msg_type']
-                    summary = curr['summary']
-                    if msg_type not in (1, 10000) and msg_type != 49:
-                        summary = ''
+                    summary = format_summary(curr['msg_type'], curr['summary'])
                     print(f"[{ts}] 新会话 [{display}]")
-                    if summary:
-                        print(f"  [{format_msg_type(msg_type)}] {summary}")
-                    else:
-                        print(f"  [{format_msg_type(msg_type)}]")
+                    print(f"  {summary}")
                     print()
                     continue
 
                 if curr['timestamp'] > prev['timestamp']:
                     display = contact_names.get(username) or curr.get('display_name') or username
                     ts = datetime.fromtimestamp(curr['timestamp']).strftime('%H:%M:%S')
-                    msg_type = format_msg_type(curr['msg_type'])
+                    msg_type_label = format_msg_type(curr['msg_type'])
                     sender = curr['sender_name'] or curr['sender'] or ''
 
                     if '@chatroom' in username and sender:
@@ -184,13 +171,8 @@ def main():
                     else:
                         print(f"[{ts}] [{display}]")
 
-                    summary = curr['summary']
-                    if curr['msg_type'] not in (1, 49, 10000):
-                        summary = ''
-                    if summary:
-                        print(f"  [{msg_type}] {summary}")
-                    else:
-                        print(f"  [{msg_type}]")
+                    summary = format_summary(curr['msg_type'], curr['summary'])
+                    print(f"  [{msg_type_label}] {summary}")
 
                     if curr['unread'] > 0:
                         print(f"  (未读: {curr['unread']})")
