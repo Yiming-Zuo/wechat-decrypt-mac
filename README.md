@@ -1,58 +1,56 @@
-# WeChat 4.0 Database Decryptor
+# WeChat macOS Database Decryptor
 
-微信 4.0 (Windows) 本地数据库解密工具。从运行中的微信进程内存提取加密密钥，解密所有 SQLCipher 4 加密数据库，并提供实时消息监听。
+微信 3.8.x (macOS) 本地数据库解密与实时监听工具。通过 Mach API 扫描微信进程内存提取 SQLCipher 3 raw key，解密本地数据库，并提供实时消息监听和 Claude AI 集成。
 
 ## 原理
 
-微信 4.0 使用 SQLCipher 4 加密本地数据库：
-- **加密算法**: AES-256-CBC + HMAC-SHA512
-- **KDF**: PBKDF2-HMAC-SHA512, 256,000 iterations
-- **页面大小**: 4096 bytes, reserve = 80 (IV 16 + HMAC 64)
+微信 3.8.x (macOS) 使用 SQLCipher 3 加密本地数据库：
+
+- **加密算法**: AES-256-CBC + HMAC-SHA1
+- **KDF**: PBKDF2-HMAC-SHA1, 64,000 iterations
+- **页面大小**: 1024 bytes, reserve = 48 (IV 16 + HMAC 20 + pad 12)
 - **每个数据库有独立的 salt 和 enc_key**
 
-WCDB (微信的 SQLCipher 封装) 会在进程内存中缓存派生后的 raw key，格式为 `x'<64hex_enc_key><32hex_salt>'`。本工具通过扫描进程内存中的这种模式，匹配数据库文件的 salt，并通过 HMAC 验证来提取正确的密钥。
+WCDB 会在进程内存中缓存派生后的 raw key，格式为 `x'<64hex_enc_key><32hex_salt>'`。本工具通过 macOS Mach API 扫描进程内存中的这种模式，匹配数据库文件的 salt，并通过 HMAC 验证提取正确的密钥。
 
-## 使用方法
+## 环境要求
 
-### 环境要求
-
-- Windows 10/11
+- macOS (Apple Silicon)
 - Python 3.10+
-- 微信 4.0 (正在运行)
-- 需要管理员权限 (读取进程内存)
+- 微信 3.8.x (正在运行)
+- SIP 关闭 (`csrutil disable`)
+- `sudo` 权限 (读取进程内存需要 `task_for_pid`)
 
-### 安装依赖
+## 安装依赖
 
 ```bash
 pip install pycryptodome
+pip install mcp  # 仅 MCP Server 需要
 ```
+
+## 使用方法
 
 ### 1. 配置
 
-复制配置模板并修改：
+首次运行任意脚本会自动生成 `config.json` 模板：
 
-```bash
-copy config.example.json config.json
-```
-
-编辑 `config.json`：
 ```json
 {
-    "db_dir": "D:\\xwechat_files\\你的微信ID\\db_storage",
+    "db_dir": "~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/<user_hash>",
     "keys_file": "all_keys.json",
     "decrypted_dir": "decrypted",
-    "wechat_process": "Weixin.exe"
+    "wechat_process": "WeChat"
 }
 ```
 
-`db_dir` 路径可以在 微信设置 → 文件管理 中找到。
+将 `db_dir` 中的 `<user_hash>` 替换为实际路径（可在 `~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/` 下找到）。
 
 ### 2. 提取密钥
 
-确保微信正在运行，以**管理员权限**运行：
+确保微信正在运行，关闭 SIP 后以 `sudo` 运行：
 
 ```bash
-python find_all_keys.py
+sudo python find_all_keys.py
 ```
 
 密钥将保存到 `all_keys.json`。
@@ -63,7 +61,7 @@ python find_all_keys.py
 python decrypt_db.py
 ```
 
-解密后的数据库保存在 `decrypted/` 目录，可以直接用 SQLite 工具打开。
+解密后的数据库保存在 `decrypted/` 目录，可直接用 SQLite 工具打开。
 
 ### 4. 实时消息监听
 
@@ -76,9 +74,8 @@ python monitor_web.py
 打开 http://localhost:5678 查看实时消息流。
 
 - 30ms 轮询 WAL 文件变化 (mtime)
-- 检测到变化后全量解密 + WAL patch (~70ms)
+- 检测到变化后全量解密 + WAL patch
 - SSE 实时推送到浏览器
-- 总延迟约 100ms
 
 #### 命令行
 
@@ -92,14 +89,10 @@ python monitor.py
 
 将微信数据查询能力接入 [Claude Code](https://claude.ai/claude-code)，让 AI 直接读取你的微信消息。
 
-```bash
-pip install mcp
-```
-
 注册到 Claude Code：
 
 ```bash
-claude mcp add wechat -- python C:\Users\你的用户名\wechat-decrypt\mcp_server.py
+claude mcp add wechat -- python /path/to/wechat-decrypt/mcp_server.py
 ```
 
 或手动编辑 `~/.claude.json`：
@@ -110,7 +103,7 @@ claude mcp add wechat -- python C:\Users\你的用户名\wechat-decrypt\mcp_serv
     "wechat": {
       "type": "stdio",
       "command": "python",
-      "args": ["C:\\Users\\你的用户名\\wechat-decrypt\\mcp_server.py"]
+      "args": ["/path/to/wechat-decrypt/mcp_server.py"]
     }
   }
 }
@@ -128,15 +121,14 @@ claude mcp add wechat -- python C:\Users\你的用户名\wechat-decrypt\mcp_serv
 
 前置条件：需要先完成步骤 1-2（配置 + 提取密钥）。
 
-**[查看使用案例 →](USAGE.md)**
-
 ## 文件说明
 
 | 文件 | 说明 |
 |------|------|
-| `config.py` | 配置加载器 |
-| `find_all_keys.py` | 从微信进程内存提取所有数据库密钥 |
-| `decrypt_db.py` | 全量解密所有数据库 |
+| `config.py` | 配置加载器，支持 `~` 和相对路径 |
+| `crypto_params.py` | SQLCipher 3 解密原语和加密常量 |
+| `find_all_keys.py` | 通过 macOS Mach API 扫描进程内存提取密钥 |
+| `decrypt_db.py` | 全量解密所有数据库到 `decrypted/` |
 | `mcp_server.py` | MCP Server，让 Claude AI 查询微信数据 |
 | `monitor_web.py` | 实时消息监听 (Web UI + SSE) |
 | `monitor.py` | 实时消息监听 (命令行) |
@@ -144,21 +136,22 @@ claude mcp add wechat -- python C:\Users\你的用户名\wechat-decrypt\mcp_serv
 
 ## 技术细节
 
+### macOS Mach API
+
+- `task_for_pid` 需要 `sudo` + SIP 关闭
+- `mach_vm_region` + `vm_region_basic_info_64` 枚举内存区域
+- `mach_vm_read_overwrite` 读取内存
+- 双策略搜索：主策略 `x'<hex>'` 正则匹配 + fallback raw salt 扫描
+
 ### WAL 处理
 
-微信使用 SQLite WAL 模式，WAL 文件是**预分配固定大小** (4MB)。检测变化时：
-- 不能用文件大小 (永远不变)
-- 使用 mtime 检测写入
-- 解密 WAL frame 时需校验 salt 值，跳过旧周期遗留的 frame
+微信使用预分配固定大小的 WAL 文件，不能用文件大小检测变化，必须用 mtime。解密 WAL frame 时需校验 frame salt 与 WAL header salt 一致，跳过旧周期遗留的 frame。
 
-### 数据库结构
+### 数据库结构 (3.8.x macOS)
 
-解密后包含约 26 个数据库：
-- `session/session.db` - 会话列表 (最新消息摘要)
-- `message/message_*.db` - 聊天记录
-- `contact/contact.db` - 联系人
-- `media_*/media_*.db` - 媒体文件索引
-- 其他: head_image, favorite, sns, emoticon 等
+- `Session/session_new.db` - 会话列表
+- `Message/msg_N.db` - 聊天记录，每个联系人对应表 `Msg_<md5(username)>`
+- `Contact/wccontact_new2.db` - 联系人
 
 ## 免责声明
 
