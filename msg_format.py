@@ -5,7 +5,9 @@ def format_msg_type(t):
     return {
         1: '文本', 3: '图片', 34: '语音', 42: '名片',
         43: '视频', 47: '表情', 48: '位置', 49: '链接/文件',
-        50: '通话', 62: '短视频', 10000: '系统', 10002: '撤回',
+        50: '通话', 62: '短视频',
+        66: '转账', 436207665: '红包',
+        10000: '系统', 10002: '撤回',
     }.get(t, f'type={t}')
 
 
@@ -15,7 +17,11 @@ def _format_appmsg(text):
 
     def _xml_val(tag):
         m = re.search(rf'<{tag}[^>]*>(.*?)</{tag}>', text, re.DOTALL)
-        return m.group(1).strip() if m else ''
+        if not m:
+            return ''
+        val = m.group(1).strip()
+        cdata = re.match(r'<!\[CDATA\[(.*?)]]>', val, re.DOTALL)
+        return cdata.group(1).strip() if cdata else val
 
     title = _xml_val('title')
     sub_type = _xml_val('type')
@@ -41,6 +47,23 @@ def _format_appmsg(text):
         if appname:
             result += f" - {appname}"
         return result
+
+    if sub_type in ('33', '36'):
+        appname = _xml_val('appname') or _xml_val('sourcedisplayname')
+        result = f"[小程序] {title}" if title else "[小程序]"
+        if appname:
+            result += f" - {appname}"
+        return result
+
+    if sub_type == '3':
+        appname = _xml_val('appname')
+        result = f"[音乐] {title}" if title else "[音乐]"
+        if appname:
+            result += f" - {appname}"
+        return result
+
+    if sub_type == '19':
+        return f"[合并转发] {title}" if title else "[合并转发]"
 
     return f"[链接/文件] {title}" if title else "[链接/文件]"
 

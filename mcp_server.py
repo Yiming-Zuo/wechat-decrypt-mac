@@ -1,20 +1,18 @@
-r"""
-WeChat MCP Server - query WeChat messages, contacts via Claude
-
-Based on FastMCP (stdio transport), reuses existing decryption.
-Runs on Windows Python (needs access to D:\ WeChat databases).
-"""
-
-import os, sys, json, re, time, sqlite3, tempfile, hashlib, atexit
+import contextlib, hashlib, json, logging, os, re, sqlite3, sys, tempfile, atexit
 from datetime import datetime
 from mcp.server.fastmcp import FastMCP
 
-from crypto_params import PAGE_SZ, full_decrypt, decrypt_wal, SQLITE_HDR, WAL_HEADER_SZ, WAL_FRAME_HEADER_SZ
+from crypto_params import full_decrypt, decrypt_wal
 from session_parser import parse_session_info
 from msg_format import format_msg_type, format_summary, resolve_sender_display
+from config import load_config
+
+logging.basicConfig(stream=sys.stderr, level=logging.WARNING,
+                    format='%(asctime)s %(levelname)s %(message)s')
+logger = logging.getLogger(__name__)
 
 # ============ 配置加载 ============
-from config import load_config
+
 _cfg = load_config()
 DB_DIR = _cfg["db_dir"]
 KEYS_FILE = _cfg["keys_file"]
@@ -57,11 +55,30 @@ class DBCache:
         enc_key = bytes.fromhex(ALL_KEYS[rel_key]["enc_key"])
         fd, tmp_path = tempfile.mkstemp(suffix='.db')
         os.close(fd)
-        full_decrypt(db_path, tmp_path, enc_key)
-        if os.path.exists(wal_path):
-            decrypt_wal(wal_path, tmp_path, enc_key)
+        try:
+            full_decrypt(db_path, tmp_path, enc_key)
+            if os.path.exists(wal_path):
+                decrypt_wal(wal_path, tmp_path, enc_key)
+        except Exception:
+            logger.error("解密失败: %s", rel_key, exc_info=True)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return None
         self._cache[rel_key] = (db_mtime, wal_mtime, tmp_path)
         return tmp_path
+
+    def mtime_of(self, rel_key):
+        """返回 DB 当前的 (db_mtime, wal_mtime)，用于外部缓存失效判断"""
+        db_path = os.path.join(DB_DIR, rel_key)
+        wal_path = db_path + "-wal"
+        try:
+            db_mt = os.path.getmtime(db_path) if os.path.exists(db_path) else 0
+            wal_mt = os.path.getmtime(wal_path) if os.path.exists(wal_path) else 0
+            return db_mt, wal_mt
+        except OSError:
+            return 0, 0
 
     def cleanup(self):
         for _, _, path in self._cache.values():
@@ -76,71 +93,94 @@ _cache = DBCache()
 atexit.register(_cache.cleanup)
 
 
-# ============ 联系人缓存 ============
+# ============ 联系人缓存（带 mtime 失效） ============
 
-_contact_names = None  # {username: display_name}
-_contact_full = None   # [{username, nick_name, remark}]
-_session_names = None  # {username: display_name} from Session protobuf
-_hash2username = None  # {Chat_<md5>: username} 反查映射
+_contact_names = None       # {username: display_name}
+_contact_full = None        # [{username, nick_name, remark}]
+_contact_mtime = (0, 0)    # (db_mtime, wal_mtime) of wccontact_new2.db
+
+_session_names = None       # {username: display_name}
+_session_mtime = (0, 0)    # (db_mtime, wal_mtime) of session_new.db
+
+_hash2username = None       # {Chat_<md5>: username}
+_hash2_sources_mtime = {}  # {rel_key: (db_mtime, wal_mtime)}
+
+_CONTACT_REL = "Contact/wccontact_new2.db"
+_SESSION_REL = "Session/session_new.db"
+_HASH2U_SOURCES = [
+    (_CONTACT_REL, "SELECT m_nsUsrName FROM WCContact"),
+    ("Group/group_new.db", "SELECT m_nsUsrName FROM GroupMember"),
+    ("Group/group_new.db", "SELECT m_nsUsrName FROM GroupContact"),
+    (_SESSION_REL, "SELECT m_nsUserName FROM SessionAbstract"),
+    (_SESSION_REL, "SELECT m_nsUserName FROM SessionAbstractBrand"),
+]
+
+
+def _db_path_for(rel_key):
+    pre = os.path.join(DECRYPTED_DIR, rel_key)
+    return pre if os.path.exists(pre) else _cache.get(rel_key)
+
+
+def _db_mtime_for(rel_key):
+    pre = os.path.join(DECRYPTED_DIR, rel_key)
+    if os.path.exists(pre):
+        wal = pre + "-wal"
+        try:
+            return os.path.getmtime(pre), os.path.getmtime(wal) if os.path.exists(wal) else 0
+        except OSError:
+            return 0, 0
+    return _cache.mtime_of(rel_key)
 
 
 def _load_contacts_from(db_path):
     names = {}
     full = []
-    conn = sqlite3.connect(db_path)
-    try:
-        for r in conn.execute("SELECT m_nsUsrName, nickname, m_nsRemark FROM WCContact").fetchall():
-            uname, nick, remark = r
+    with contextlib.closing(sqlite3.connect(db_path)) as conn:
+        for uname, nick, remark in conn.execute(
+            "SELECT m_nsUsrName, nickname, m_nsRemark FROM WCContact"
+        ).fetchall():
             display = remark if remark else nick if nick else uname
             names[uname] = display
             full.append({'username': uname, 'nick_name': nick or '', 'remark': remark or ''})
-    finally:
-        conn.close()
     return names, full
 
 
 def _merge_group_members(names):
-    """將 GroupMember 暱稱合併進 names（WCContact 優先，不覆蓋）"""
-    pre_decrypted = os.path.join(DECRYPTED_DIR, "Group", "group_new.db")
-    group_db = pre_decrypted if os.path.exists(pre_decrypted) else _cache.get("Group/group_new.db")
-    if not group_db:
+    """将 GroupMember 昵称合并进 names（WCContact 优先，不覆盖）"""
+    db = _db_path_for("Group/group_new.db")
+    if not db:
         return
     try:
-        conn = sqlite3.connect(group_db)
-        for uname, nick in conn.execute("SELECT m_nsUsrName, nickname FROM GroupMember").fetchall():
-            if uname not in names and nick:
-                names[uname] = nick
-        conn.close()
+        with contextlib.closing(sqlite3.connect(db)) as conn:
+            for uname, nick in conn.execute(
+                "SELECT m_nsUsrName, nickname FROM GroupMember"
+            ).fetchall():
+                if uname not in names and nick:
+                    names[uname] = nick
     except Exception:
-        pass
+        logger.warning("读取 GroupMember 失败", exc_info=True)
 
 
 def get_contact_names():
-    global _contact_names, _contact_full
-    if _contact_names is not None:
+    global _contact_names, _contact_full, _contact_mtime
+
+    curr_mtime = _db_mtime_for(_CONTACT_REL)
+    if _contact_names is not None and curr_mtime == _contact_mtime:
         return _contact_names
 
-    # 優先用已解密的 wccontact_new2.db
-    pre_decrypted = os.path.join(DECRYPTED_DIR, "Contact", "wccontact_new2.db")
-    if os.path.exists(pre_decrypted):
+    db = _db_path_for(_CONTACT_REL)
+    if db:
         try:
-            _contact_names, _contact_full = _load_contacts_from(pre_decrypted)
+            _contact_names, _contact_full = _load_contacts_from(db)
             _merge_group_members(_contact_names)
+            _contact_mtime = curr_mtime
             return _contact_names
         except Exception:
-            pass
+            logger.warning("加载联系人失败", exc_info=True)
 
-    # 實時解密
-    path = _cache.get("Contact/wccontact_new2.db")
-    if path:
-        try:
-            _contact_names, _contact_full = _load_contacts_from(path)
-            _merge_group_members(_contact_names)
-            return _contact_names
-        except Exception:
-            pass
-
-    return {}
+    if _contact_names is None:
+        _contact_names, _contact_full = {}, []
+    return _contact_names
 
 
 def get_contact_full():
@@ -153,56 +193,104 @@ def get_contact_full():
 # ============ 辅助函数 ============
 
 def _get_session_names():
-    global _session_names
-    if _session_names is not None:
+    global _session_names, _session_mtime
+
+    curr_mtime = _db_mtime_for(_SESSION_REL)
+    if _session_names is not None and curr_mtime == _session_mtime:
         return _session_names
+
     _session_names = {}
-    path = _cache.get("Session/session_new.db")
+    path = _db_path_for(_SESSION_REL) or _cache.get(_SESSION_REL)
     if not path:
         return _session_names
-    conn = sqlite3.connect(path)
     try:
-        for username, blob in conn.execute(
-            "SELECT m_nsUserName, _packed_MMSessionInfo FROM SessionAbstract WHERE m_uLastTime > 0"
-        ).fetchall():
-            name = parse_session_info(blob).get('display_name', '')
-            if name:
-                _session_names[username] = name
+        with contextlib.closing(sqlite3.connect(path)) as conn:
+            for username, blob in conn.execute(
+                "SELECT m_nsUserName, _packed_MMSessionInfo FROM SessionAbstract WHERE m_uLastTime > 0"
+            ).fetchall():
+                name = parse_session_info(blob).get('display_name', '')
+                if name:
+                    _session_names[username] = name
+        _session_mtime = curr_mtime
     except Exception:
-        pass
-    finally:
-        conn.close()
+        logger.warning("读取 session 名称失败", exc_info=True)
     return _session_names
 
 
 def _build_hash2username():
-    """聚合所有已知 username，構建 Chat_<md5> → username 反查映射"""
-    global _hash2username
-    if _hash2username is not None:
+    global _hash2username, _hash2_sources_mtime
+
+    curr_mtimes = {rel: _db_mtime_for(rel) for rel, _ in _HASH2U_SOURCES}
+    if _hash2username is not None and curr_mtimes == _hash2_sources_mtime:
         return _hash2username
 
     usernames = set()
-    sources = [
-        ("Contact/wccontact_new2.db", "SELECT m_nsUsrName FROM WCContact"),
-        ("Group/group_new.db", "SELECT m_nsUsrName FROM GroupMember"),
-        ("Group/group_new.db", "SELECT m_nsUsrName FROM GroupContact"),
-        ("Session/session_new.db", "SELECT m_nsUserName FROM SessionAbstract"),
-        ("Session/session_new.db", "SELECT m_nsUserName FROM SessionAbstractBrand"),
-    ]
-    for rel, sql in sources:
-        pre = os.path.join(DECRYPTED_DIR, rel)
-        db = pre if os.path.exists(pre) else _cache.get(rel)
+    for rel, sql in _HASH2U_SOURCES:
+        db = _db_path_for(rel)
         if not db:
             continue
         try:
-            conn = sqlite3.connect(db)
-            usernames |= {r[0] for r in conn.execute(sql).fetchall() if r[0]}
-            conn.close()
+            with contextlib.closing(sqlite3.connect(db)) as conn:
+                usernames |= {r[0] for r in conn.execute(sql).fetchall() if r[0]}
         except Exception:
-            pass
+            logger.warning("读取 username 失败: %s", rel, exc_info=True)
 
     _hash2username = {f"Chat_{hashlib.md5(u.encode()).hexdigest()}": u for u in usernames}
+    _hash2_sources_mtime = curr_mtimes
     return _hash2username
+
+
+# ============ 消息表索引（带 mtime 失效） ============
+
+_msg_table_index = None   # {table_name: rel_key}
+_msg_index_mtime = {}     # {rel_key: (db_mtime, wal_mtime)}
+
+_TABLE_NAME_RE = re.compile(r'^Chat_[0-9a-f]{32}$')
+
+MSG_DB_KEYS = sorted([
+    k for k in ALL_KEYS
+    if k.startswith("Message/msg_") and k.endswith(".db")
+    and "fts" not in k and "resource" not in k
+])
+
+
+def _get_msg_table_index():
+    global _msg_table_index, _msg_index_mtime
+
+    curr_mtimes = {k: _cache.mtime_of(k) for k in MSG_DB_KEYS}
+    if _msg_table_index is not None and curr_mtimes == _msg_index_mtime:
+        return _msg_table_index
+
+    index = {}
+    for rel_key in MSG_DB_KEYS:
+        path = _cache.get(rel_key)
+        if not path:
+            continue
+        try:
+            with contextlib.closing(sqlite3.connect(path)) as conn:
+                for (tname,) in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%' AND name NOT LIKE '%_dels'"
+                ).fetchall():
+                    if _TABLE_NAME_RE.match(tname):
+                        index[tname] = rel_key
+        except Exception:
+            logger.warning("索引消息表失败: %s", rel_key, exc_info=True)
+
+    _msg_table_index = index
+    _msg_index_mtime = curr_mtimes
+    return _msg_table_index
+
+
+def _find_msg_table_for_user(username):
+    """在消息表索引中查找用户的消息表，返回 (db_path, table_name)"""
+    table_name = f"Chat_{hashlib.md5(username.encode()).hexdigest()}"
+    index = _get_msg_table_index()
+    rel_key = index.get(table_name)
+    if rel_key:
+        path = _cache.get(rel_key)
+        if path:
+            return path, table_name
+    return None, None
 
 
 def resolve_username(chat_name):
@@ -246,45 +334,10 @@ def _parse_message_content(content, local_type, is_group):
     return sender, text
 
 
-# 消息 DB 的 rel_keys（排除 fts/resource/media/biz）
-MSG_DB_KEYS = sorted([
-    k for k in ALL_KEYS
-    if k.startswith("Message/msg_") and k.endswith(".db")
-    and "fts" not in k and "resource" not in k
-])
-
-
-def _find_msg_table_for_user(username):
-    """在所有 message_N.db 中查找用户的消息表，返回 (db_path, table_name)"""
-    table_hash = hashlib.md5(username.encode()).hexdigest()
-    table_name = f"Chat_{table_hash}"
-
-    for rel_key in MSG_DB_KEYS:
-        path = _cache.get(rel_key)
-        if not path:
-            continue
-        conn = sqlite3.connect(path)
-        try:
-            exists = conn.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                (table_name,)
-            ).fetchone()
-            if exists:
-                conn.close()
-                return path, table_name
-        except Exception:
-            pass
-        finally:
-            conn.close()
-
-    return None, None
-
-
 # ============ MCP Server ============
 
 mcp = FastMCP("wechat", instructions="查询微信消息、联系人等数据")
 
-# 新消息追踪
 _last_check_state = {}  # {username: last_timestamp}
 
 
@@ -296,24 +349,26 @@ def get_recent_sessions(limit: int = 20) -> str:
     Args:
         limit: 返回的会话数量，默认20
     """
-    path = _cache.get("Session/session_new.db")
+    path = _cache.get(_SESSION_REL)
     if not path:
         return json.dumps({"error": "无法解密 session_new.db"}, ensure_ascii=False)
 
     names = get_contact_names()
-    conn = sqlite3.connect(path)
-    rows = conn.execute("""
-        SELECT m_nsUserName, m_uUnReadCount, m_uLastTime, _packed_MMSessionInfo
-        FROM SessionAbstract
-        WHERE m_uLastTime > 0
-        ORDER BY m_uLastTime DESC
-        LIMIT ?
-    """, (limit,)).fetchall()
-    conn.close()
+    try:
+        with contextlib.closing(sqlite3.connect(path)) as conn:
+            rows = conn.execute("""
+                SELECT m_nsUserName, m_uUnReadCount, m_uLastTime, _packed_MMSessionInfo
+                FROM SessionAbstract
+                WHERE m_uLastTime > 0
+                ORDER BY m_uLastTime DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
+    except Exception:
+        logger.error("查询 SessionAbstract 失败", exc_info=True)
+        return json.dumps({"error": "查询会话失败"}, ensure_ascii=False)
 
     sessions = []
-    for r in rows:
-        username, unread, ts, blob = r
+    for username, unread, ts, blob in rows:
         info = parse_session_info(blob)
         display = names.get(username) or info.get('display_name') or username
         is_group = '@chatroom' in username
@@ -350,18 +405,17 @@ def get_chat_history(chat_name: str, limit: int = 50) -> str:
     if not db_path:
         return json.dumps({"username": username, "display": display_name, "count": 0, "messages": [], "error": "找不到消息记录"}, ensure_ascii=False)
 
-    conn = sqlite3.connect(db_path)
     try:
-        rows = conn.execute(f"""
-            SELECT messageType, msgCreateTime, msgContent, mesDes
-            FROM [{table_name}]
-            ORDER BY msgCreateTime DESC
-            LIMIT ?
-        """, (limit,)).fetchall()
+        with contextlib.closing(sqlite3.connect(db_path)) as conn:
+            rows = conn.execute(f"""
+                SELECT messageType, msgCreateTime, msgContent, mesDes
+                FROM [{table_name}]
+                ORDER BY msgCreateTime DESC
+                LIMIT ?
+            """, (limit,)).fetchall()
     except Exception as e:
-        conn.close()
+        logger.error("查询消息失败: %s", table_name, exc_info=True)
         return json.dumps({"error": f"查询失败: {e}"}, ensure_ascii=False)
-    conn.close()
 
     if not rows:
         return json.dumps({"username": username, "display": display_name, "count": 0, "messages": []}, ensure_ascii=False)
@@ -398,55 +452,58 @@ def search_messages(keyword: str, limit: int = 20) -> str:
         keyword: 搜索关键词
         limit: 返回的结果数量，默认20
     """
-    if not keyword or len(keyword) < 1:
+    if not keyword:
         return json.dumps({"error": "请提供搜索关键词"}, ensure_ascii=False)
 
     names = get_contact_names()
     hash2u = _build_hash2username()
+    index = _get_msg_table_index()
     results = []
 
-    for rel_key in MSG_DB_KEYS:
+    # 按 rel_key 分组，避免重复打开同一 DB
+    rel_to_tables: dict[str, list[str]] = {}
+    for tname, rel_key in index.items():
+        rel_to_tables.setdefault(rel_key, []).append(tname)
+
+    per_table_limit = max(5, limit)
+
+    for rel_key, tables in rel_to_tables.items():
         path = _cache.get(rel_key)
         if not path:
             continue
-
-        conn = sqlite3.connect(path)
         try:
-            tables = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%' AND name NOT LIKE '%_dels'"
-            ).fetchall()
+            with contextlib.closing(sqlite3.connect(path)) as conn:
+                for tname in tables:
+                    username = hash2u.get(tname, '')
+                    is_group = '@chatroom' in username
+                    display = names.get(username) or _get_session_names().get(username) or username if username else tname
+                    try:
+                        rows = conn.execute(f"""
+                            SELECT messageType, msgCreateTime, msgContent, mesDes
+                            FROM [{tname}]
+                            WHERE typeof(msgContent) = 'text' AND msgContent LIKE ?
+                            ORDER BY msgCreateTime DESC
+                            LIMIT ?
+                        """, (f'%{keyword}%', per_table_limit)).fetchall()
+                    except Exception:
+                        logger.warning("搜索表失败: %s", tname, exc_info=True)
+                        continue
 
-            for (tname,) in tables:
-                username = hash2u.get(tname, '')
-                is_group = '@chatroom' in username
-                display = names.get(username) or _get_session_names().get(username) or username if username else tname
-
-                try:
-                    rows = conn.execute(f"""
-                        SELECT messageType, msgCreateTime, msgContent, mesDes
-                        FROM [{tname}]
-                        WHERE typeof(msgContent) = 'text' AND msgContent LIKE ?
-                        ORDER BY msgCreateTime DESC
-                        LIMIT ?
-                    """, (f'%{keyword}%', limit)).fetchall()
-                except Exception:
-                    continue
-
-                for local_type, ts, content, mes_des in rows:
-                    sender, text = _parse_message_content(content, local_type, is_group)
-                    if local_type != 1:
-                        text = format_summary(local_type, text)
-                    if text and len(text) > 300:
-                        text = text[:300] + "..."
-                    time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
-                    sender_label = resolve_sender_display(mes_des, username, sender, names)
-                    results.append((ts, {
-                        "time": time_str, "chat": display, "username": username,
-                        "is_group": is_group,
-                        "sender": sender_label, "content": text,
-                    }))
-        finally:
-            conn.close()
+                    for local_type, ts, content, mes_des in rows:
+                        sender, text = _parse_message_content(content, local_type, is_group)
+                        if local_type != 1:
+                            text = format_summary(local_type, text)
+                        if text and len(text) > 300:
+                            text = text[:300] + "..."
+                        time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+                        sender_label = resolve_sender_display(mes_des, username, sender, names)
+                        results.append((ts, {
+                            "time": time_str, "chat": display, "username": username,
+                            "is_group": is_group,
+                            "sender": sender_label, "content": text,
+                        }))
+        except Exception:
+            logger.warning("打开消息 DB 失败: %s", rel_key, exc_info=True)
 
     results.sort(key=lambda x: x[0], reverse=True)
     entries = [r[1] for r in results[:limit]]
@@ -493,23 +550,25 @@ def get_new_messages() -> str:
     """获取自上次调用以来的新消息。首次调用返回最近的会话状态。"""
     global _last_check_state
 
-    path = _cache.get("Session/session_new.db")
+    path = _cache.get(_SESSION_REL)
     if not path:
         return json.dumps({"error": "无法解密 session_new.db"}, ensure_ascii=False)
 
     names = get_contact_names()
-    conn = sqlite3.connect(path)
-    rows = conn.execute("""
-        SELECT m_nsUserName, m_uUnReadCount, m_uLastTime, _packed_MMSessionInfo
-        FROM SessionAbstract
-        WHERE m_uLastTime > 0
-        ORDER BY m_uLastTime DESC
-    """).fetchall()
-    conn.close()
+    try:
+        with contextlib.closing(sqlite3.connect(path)) as conn:
+            rows = conn.execute("""
+                SELECT m_nsUserName, m_uUnReadCount, m_uLastTime, _packed_MMSessionInfo
+                FROM SessionAbstract
+                WHERE m_uLastTime > 0
+                ORDER BY m_uLastTime DESC
+            """).fetchall()
+    except Exception:
+        logger.error("查询新消息失败", exc_info=True)
+        return json.dumps({"error": "查询失败"}, ensure_ascii=False)
 
     curr_state = {}
-    for r in rows:
-        username, unread, ts, blob = r
+    for username, unread, ts, blob in rows:
         info = parse_session_info(blob)
         curr_state[username] = {
             'unread': unread or 0, 'summary': info['summary'], 'timestamp': ts,
@@ -520,18 +579,17 @@ def get_new_messages() -> str:
 
     if not _last_check_state:
         _last_check_state = {u: s['timestamp'] for u, s in curr_state.items()}
-        unread_list = []
-        for username, s in curr_state.items():
-            if s['unread'] and s['unread'] > 0:
-                display = names.get(username) or s.get('display_name') or username
-                unread_list.append({
-                    "username": username, "display": display,
-                    "is_group": '@chatroom' in username,
-                    "unread": s['unread'],
-                    "time": datetime.fromtimestamp(s['timestamp']).strftime('%H:%M'),
-                    "type": format_msg_type(s['msg_type']),
-                    "content": format_summary(s['msg_type'], s['summary']),
-                })
+        unread_list = [
+            {
+                "username": u, "display": names.get(u) or s.get('display_name') or u,
+                "is_group": '@chatroom' in u,
+                "unread": s['unread'],
+                "time": datetime.fromtimestamp(s['timestamp']).strftime('%H:%M'),
+                "type": format_msg_type(s['msg_type']),
+                "content": format_summary(s['msg_type'], s['summary']),
+            }
+            for u, s in curr_state.items() if s['unread'] > 0
+        ]
         return json.dumps({"first_call": True, "count": len(unread_list), "unread": unread_list}, ensure_ascii=False)
 
     new_msgs = []
