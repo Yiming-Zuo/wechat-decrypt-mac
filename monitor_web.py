@@ -6,32 +6,30 @@ http://localhost:5678
 - 检测到变化后：全量解密DB + 全量WAL patch
 - SSE 服务器推送
 """
-import hashlib, struct, os, sys, json, time, sqlite3, io, threading, queue
-import hmac as hmac_mod
+import os, sys, json, time, sqlite3, io, threading, queue, struct
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
-from Crypto.Cipher import AES
 import urllib.parse
 
-PAGE_SZ = 4096
-KEY_SZ = 32
-SALT_SZ = 16
-RESERVE_SZ = 80
-SQLITE_HDR = b'SQLite format 3\x00'
-WAL_HEADER_SZ = 32
-WAL_FRAME_HEADER_SZ = 24
+from crypto_params import (
+    PAGE_SZ, SQLITE_HDR, WAL_HEADER_SZ, WAL_FRAME_HEADER_SZ,
+    decrypt_page,
+)
 
 from config import load_config
+from session_parser import parse_session_info
 _cfg = load_config()
 DB_DIR = _cfg["db_dir"]
 KEYS_FILE = _cfg["keys_file"]
-CONTACT_CACHE = os.path.join(_cfg["decrypted_dir"], "contact", "contact.db")
-DECRYPTED_SESSION = os.path.join(_cfg["decrypted_dir"], "session", "session.db")
+CONTACT_CACHE = os.path.join(_cfg["decrypted_dir"], "Contact", "wccontact_new2.db")
+DECRYPTED_SESSION = os.path.join(_cfg["decrypted_dir"], "Session", "session_new.db")
+
+SESSION_KEY = "Session/session_new.db"
+SESSION_REL = "Session/session_new.db"
 
 POLL_MS = 30  # 高频轮询WAL/DB的mtime，30ms一次
 PORT = 5678
-
 sse_clients = []
 sse_lock = threading.Lock()
 messages_log = []
@@ -39,102 +37,28 @@ messages_lock = threading.Lock()
 MAX_LOG = 500
 
 
-def decrypt_page(enc_key, page_data, pgno):
-    """解密单个加密页面"""
-    iv = page_data[PAGE_SZ - RESERVE_SZ: PAGE_SZ - RESERVE_SZ + 16]
-    if pgno == 1:
-        encrypted = page_data[SALT_SZ: PAGE_SZ - RESERVE_SZ]
-        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
-        return bytearray(SQLITE_HDR + decrypted + b'\x00' * RESERVE_SZ)
-    else:
-        encrypted = page_data[:PAGE_SZ - RESERVE_SZ]
-        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
-        return decrypted + b'\x00' * RESERVE_SZ
-
-
 def full_decrypt(db_path, out_path, enc_key):
-    """首次全量解密"""
+    from crypto_params import full_decrypt as _fd
     t0 = time.perf_counter()
-    file_size = os.path.getsize(db_path)
-    total_pages = file_size // PAGE_SZ
-
-    with open(db_path, 'rb') as fin, open(out_path, 'wb') as fout:
-        for pgno in range(1, total_pages + 1):
-            page = fin.read(PAGE_SZ)
-            if len(page) < PAGE_SZ:
-                if len(page) > 0:
-                    page = page + b'\x00' * (PAGE_SZ - len(page))
-                else:
-                    break
-            fout.write(decrypt_page(enc_key, page, pgno))
-
-    ms = (time.perf_counter() - t0) * 1000
-    return total_pages, ms
+    total_pages = _fd(db_path, out_path, enc_key)
+    return total_pages, (time.perf_counter() - t0) * 1000
 
 
 def decrypt_wal_full(wal_path, out_path, enc_key):
-    """解密WAL当前有效frame，patch到已解密的DB副本
-
-    WAL是预分配固定大小(4MB)，包含当前有效frame和上一轮遗留的旧frame。
-    通过WAL header中的salt值区分：只有frame header的salt匹配WAL header的才是有效frame。
-
-    返回: (patched_pages, elapsed_ms)
-    """
+    from crypto_params import decrypt_wal as _dw
     t0 = time.perf_counter()
-
-    if not os.path.exists(wal_path):
-        return 0, 0
-
-    wal_size = os.path.getsize(wal_path)
-    if wal_size <= WAL_HEADER_SZ:
-        return 0, 0
-
-    frame_size = WAL_FRAME_HEADER_SZ + PAGE_SZ  # 24 + 4096 = 4120
-    patched = 0
-
-    with open(wal_path, 'rb') as wf, open(out_path, 'r+b') as df:
-        # 读WAL header，获取当前salt值
-        wal_hdr = wf.read(WAL_HEADER_SZ)
-        wal_salt1 = struct.unpack('>I', wal_hdr[16:20])[0]
-        wal_salt2 = struct.unpack('>I', wal_hdr[20:24])[0]
-
-        while wf.tell() + frame_size <= wal_size:
-            fh = wf.read(WAL_FRAME_HEADER_SZ)
-            if len(fh) < WAL_FRAME_HEADER_SZ:
-                break
-            pgno = struct.unpack('>I', fh[0:4])[0]
-            frame_salt1 = struct.unpack('>I', fh[8:12])[0]
-            frame_salt2 = struct.unpack('>I', fh[12:16])[0]
-
-            ep = wf.read(PAGE_SZ)
-            if len(ep) < PAGE_SZ:
-                break
-
-            # 校验: pgno有效 且 salt匹配当前WAL周期
-            if pgno == 0 or pgno > 1000000:
-                continue
-            if frame_salt1 != wal_salt1 or frame_salt2 != wal_salt2:
-                continue  # 旧周期遗留的frame，跳过
-
-            dec = decrypt_page(enc_key, ep, pgno)
-            df.seek((pgno - 1) * PAGE_SZ)
-            df.write(dec)
-            patched += 1
-
-    ms = (time.perf_counter() - t0) * 1000
-    return patched, ms
+    patched = _dw(wal_path, out_path, enc_key)
+    return patched, (time.perf_counter() - t0) * 1000
 
 
 def load_contact_names():
     names = {}
     try:
         conn = sqlite3.connect(CONTACT_CACHE)
-        for r in conn.execute("SELECT username, nick_name, remark FROM contact").fetchall():
+        for r in conn.execute("SELECT m_nsUsrName, nickname, m_nsRemark FROM WCContact").fetchall():
             names[r[0]] = r[2] if r[2] else r[1] if r[1] else r[0]
         conn.close()
-    except:
+    except Exception:
         pass
     return names
 
@@ -143,7 +67,7 @@ def format_msg_type(t):
     return {
         1: '文本', 3: '图片', 34: '语音', 42: '名片',
         43: '视频', 47: '表情', 48: '位置', 49: '链接/文件',
-        50: '通话', 10000: '系统', 10002: '撤回',
+        50: '通话', 62: '短视频', 10000: '系统', 10002: '撤回',
     }.get(t, f'type={t}')
 
 
@@ -181,18 +105,21 @@ class SessionMonitor:
         self.patched_pages = 0
 
     def query_state(self):
-        """查询已解密副本的session状态"""
         conn = sqlite3.connect(f"file:{DECRYPTED_SESSION}?mode=ro", uri=True)
         state = {}
-        for r in conn.execute("""
-            SELECT username, unread_count, summary, last_timestamp,
-                   last_msg_type, last_msg_sender, last_sender_display_name
-            FROM SessionTable WHERE last_timestamp > 0
-        """).fetchall():
-            state[r[0]] = {
-                'unread': r[1], 'summary': r[2] or '', 'timestamp': r[3],
-                'msg_type': r[4], 'sender': r[5] or '', 'sender_name': r[6] or '',
-            }
+        try:
+            for r in conn.execute("""
+                SELECT m_nsUserName, m_uUnReadCount, m_uLastTime, _packed_MMSessionInfo
+                FROM SessionAbstract WHERE m_uLastTime > 0
+            """).fetchall():
+                info = parse_session_info(r[3])
+                state[r[0]] = {
+                    'unread': r[1] or 0, 'summary': info['summary'], 'timestamp': r[2],
+                    'msg_type': info['msg_type'], 'sender': info['sender'], 'sender_name': '',
+                    'display_name': info.get('display_name', ''),
+                }
+        except Exception:
+            pass
         conn.close()
         return state
 
@@ -230,15 +157,15 @@ class SessionMonitor:
         for username, curr in curr_state.items():
             prev = self.prev_state.get(username)
             if prev and curr['timestamp'] > prev['timestamp']:
-                display = self.contact_names.get(username, username)
+                display = self.contact_names.get(username) or curr.get('display_name') or username
                 is_group = '@chatroom' in username
                 sender = ''
                 if is_group:
                     sender = self.contact_names.get(curr['sender'], curr['sender_name'] or curr['sender'])
 
                 summary = curr['summary']
-                if summary and ':\n' in summary:
-                    summary = summary.split(':\n', 1)[1]
+                if curr['msg_type'] not in (1, 49, 10000):
+                    summary = f"[{format_msg_type(curr['msg_type'])}]"
 
                 new_msgs.append({
                     'time': datetime.fromtimestamp(curr['timestamp']).strftime('%H:%M:%S'),
@@ -522,8 +449,8 @@ def main():
     with open(KEYS_FILE) as f:
         keys = json.load(f)
 
-    enc_key = bytes.fromhex(keys["session\\session.db"]["enc_key"])
-    session_db = os.path.join(DB_DIR, "session", "session.db")
+    enc_key = bytes.fromhex(keys[SESSION_KEY]["enc_key"])
+    session_db = os.path.join(DB_DIR, SESSION_REL)
 
     print("加载联系人...", flush=True)
     contact_names = load_contact_names()
@@ -537,8 +464,9 @@ def main():
     print("Ctrl+C 停止\n", flush=True)
 
     try:
-        os.system(f'cmd.exe /c start http://localhost:{PORT}')
-    except:
+        import webbrowser
+        webbrowser.open(f'http://localhost:{PORT}')
+    except Exception:
         pass
 
     try:

@@ -5,102 +5,22 @@ Based on FastMCP (stdio transport), reuses existing decryption.
 Runs on Windows Python (needs access to D:\ WeChat databases).
 """
 
-import os, sys, json, time, sqlite3, tempfile, struct, hashlib, atexit
-import hmac as hmac_mod
+import os, sys, json, re, time, sqlite3, tempfile, hashlib, atexit
 from datetime import datetime
-from Crypto.Cipher import AES
 from mcp.server.fastmcp import FastMCP
 
-# ============ 加密常量 ============
-PAGE_SZ = 4096
-KEY_SZ = 32
-SALT_SZ = 16
-RESERVE_SZ = 80
-SQLITE_HDR = b'SQLite format 3\x00'
-WAL_HEADER_SZ = 32
-WAL_FRAME_HEADER_SZ = 24
+from crypto_params import PAGE_SZ, full_decrypt, decrypt_wal, SQLITE_HDR, WAL_HEADER_SZ, WAL_FRAME_HEADER_SZ
+from session_parser import parse_session_info
 
 # ============ 配置加载 ============
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, "config.json")
-
-with open(CONFIG_FILE) as f:
-    _cfg = json.load(f)
-for _key in ("keys_file", "decrypted_dir"):
-    if _key in _cfg and not os.path.isabs(_cfg[_key]):
-        _cfg[_key] = os.path.join(SCRIPT_DIR, _cfg[_key])
-
+from config import load_config
+_cfg = load_config()
 DB_DIR = _cfg["db_dir"]
 KEYS_FILE = _cfg["keys_file"]
 DECRYPTED_DIR = _cfg["decrypted_dir"]
 
 with open(KEYS_FILE) as f:
     ALL_KEYS = json.load(f)
-
-# ============ 解密函数 ============
-
-def decrypt_page(enc_key, page_data, pgno):
-    iv = page_data[PAGE_SZ - RESERVE_SZ : PAGE_SZ - RESERVE_SZ + 16]
-    if pgno == 1:
-        encrypted = page_data[SALT_SZ : PAGE_SZ - RESERVE_SZ]
-        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
-        return bytes(bytearray(SQLITE_HDR + decrypted + b'\x00' * RESERVE_SZ))
-    else:
-        encrypted = page_data[: PAGE_SZ - RESERVE_SZ]
-        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
-        return decrypted + b'\x00' * RESERVE_SZ
-
-
-def full_decrypt(db_path, out_path, enc_key):
-    file_size = os.path.getsize(db_path)
-    total_pages = file_size // PAGE_SZ
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    with open(db_path, 'rb') as fin, open(out_path, 'wb') as fout:
-        for pgno in range(1, total_pages + 1):
-            page = fin.read(PAGE_SZ)
-            if len(page) < PAGE_SZ:
-                if len(page) > 0:
-                    page = page + b'\x00' * (PAGE_SZ - len(page))
-                else:
-                    break
-            fout.write(decrypt_page(enc_key, page, pgno))
-    return total_pages
-
-
-def decrypt_wal(wal_path, out_path, enc_key):
-    if not os.path.exists(wal_path):
-        return 0
-    wal_size = os.path.getsize(wal_path)
-    if wal_size <= WAL_HEADER_SZ:
-        return 0
-    frame_size = WAL_FRAME_HEADER_SZ + PAGE_SZ
-    patched = 0
-    with open(wal_path, 'rb') as wf, open(out_path, 'r+b') as df:
-        wal_hdr = wf.read(WAL_HEADER_SZ)
-        wal_salt1 = struct.unpack('>I', wal_hdr[16:20])[0]
-        wal_salt2 = struct.unpack('>I', wal_hdr[20:24])[0]
-        while wf.tell() + frame_size <= wal_size:
-            fh = wf.read(WAL_FRAME_HEADER_SZ)
-            if len(fh) < WAL_FRAME_HEADER_SZ:
-                break
-            pgno = struct.unpack('>I', fh[0:4])[0]
-            frame_salt1 = struct.unpack('>I', fh[8:12])[0]
-            frame_salt2 = struct.unpack('>I', fh[12:16])[0]
-            ep = wf.read(PAGE_SZ)
-            if len(ep) < PAGE_SZ:
-                break
-            if pgno == 0 or pgno > 1000000:
-                continue
-            if frame_salt1 != wal_salt1 or frame_salt2 != wal_salt2:
-                continue
-            dec = decrypt_page(enc_key, ep, pgno)
-            df.seek((pgno - 1) * PAGE_SZ)
-            df.write(dec)
-            patched += 1
-    return patched
-
 
 # ============ DB 缓存 ============
 
@@ -113,8 +33,7 @@ class DBCache:
     def get(self, rel_key):
         if rel_key not in ALL_KEYS:
             return None
-        rel_path = rel_key.replace('\\', os.sep)
-        db_path = os.path.join(DB_DIR, rel_path)
+        db_path = os.path.join(DB_DIR, rel_key)
         wal_path = db_path + "-wal"
         if not os.path.exists(db_path):
             return None
@@ -160,6 +79,7 @@ atexit.register(_cache.cleanup)
 
 _contact_names = None  # {username: display_name}
 _contact_full = None   # [{username, nick_name, remark}]
+_session_names = None  # {username: display_name} from Session protobuf
 
 
 def _load_contacts_from(db_path):
@@ -167,7 +87,7 @@ def _load_contacts_from(db_path):
     full = []
     conn = sqlite3.connect(db_path)
     try:
-        for r in conn.execute("SELECT username, nick_name, remark FROM contact").fetchall():
+        for r in conn.execute("SELECT m_nsUsrName, nickname, m_nsRemark FROM WCContact").fetchall():
             uname, nick, remark = r
             display = remark if remark else nick if nick else uname
             names[uname] = display
@@ -182,8 +102,8 @@ def get_contact_names():
     if _contact_names is not None:
         return _contact_names
 
-    # 优先用已解密的 contact.db
-    pre_decrypted = os.path.join(DECRYPTED_DIR, "contact", "contact.db")
+    # 优先用已解密的 wccontact_new2.db
+    pre_decrypted = os.path.join(DECRYPTED_DIR, "Contact", "wccontact_new2.db")
     if os.path.exists(pre_decrypted):
         try:
             _contact_names, _contact_full = _load_contacts_from(pre_decrypted)
@@ -192,7 +112,7 @@ def get_contact_names():
             pass
 
     # 实时解密
-    path = _cache.get("contact\\contact.db")
+    path = _cache.get("Contact/wccontact_new2.db")
     if path:
         try:
             _contact_names, _contact_full = _load_contacts_from(path)
@@ -216,19 +136,40 @@ def format_msg_type(t):
     return {
         1: '文本', 3: '图片', 34: '语音', 42: '名片',
         43: '视频', 47: '表情', 48: '位置', 49: '链接/文件',
-        50: '通话', 10000: '系统', 10002: '撤回',
+        50: '通话', 62: '短视频', 10000: '系统', 10002: '撤回',
     }.get(t, f'type={t}')
+
+
+def _get_session_names():
+    global _session_names
+    if _session_names is not None:
+        return _session_names
+    _session_names = {}
+    path = _cache.get("Session/session_new.db")
+    if not path:
+        return _session_names
+    conn = sqlite3.connect(path)
+    try:
+        for username, blob in conn.execute(
+            "SELECT m_nsUserName, _packed_MMSessionInfo FROM SessionAbstract WHERE m_uLastTime > 0"
+        ).fetchall():
+            name = parse_session_info(blob).get('display_name', '')
+            if name:
+                _session_names[username] = name
+    except Exception:
+        pass
+    finally:
+        conn.close()
+    return _session_names
 
 
 def resolve_username(chat_name):
     """将聊天名/备注名/wxid 解析为 username"""
     names = get_contact_names()
 
-    # 直接是 username
     if chat_name in names or chat_name.startswith('wxid_') or '@chatroom' in chat_name:
         return chat_name
 
-    # 模糊匹配(优先精确包含)
     chat_lower = chat_name.lower()
     for uname, display in names.items():
         if chat_lower == display.lower():
@@ -237,7 +178,36 @@ def resolve_username(chat_name):
         if chat_lower in display.lower():
             return uname
 
+    session_names = _get_session_names()
+    for uname, display in session_names.items():
+        if chat_lower == display.lower():
+            return uname
+    for uname, display in session_names.items():
+        if chat_lower in display.lower():
+            return uname
+
     return None
+
+
+def _extract_link_title(text):
+    """从 type=49 的 XML 内容中提取 <title> 标签值"""
+    if not text:
+        return ''
+    m = re.search(r'<title[^>]*>(.*?)</title>', text, re.DOTALL)
+    return m.group(1).strip() if m else ''
+
+
+def format_summary(msg_type, summary):
+    """根据消息类型格式化摘要，非文本消息替换为类型标签"""
+    if msg_type == 1:
+        return summary or ''
+    type_label = format_msg_type(msg_type)
+    if msg_type == 49:
+        title = _extract_link_title(summary)
+        return f"[{type_label}] {title}" if title else f"[{type_label}]"
+    if msg_type == 10000:
+        return summary or f"[{type_label}]"
+    return f"[{type_label}]"
 
 
 def _parse_message_content(content, local_type, is_group):
@@ -258,7 +228,7 @@ def _parse_message_content(content, local_type, is_group):
 # 消息 DB 的 rel_keys（排除 fts/resource/media/biz）
 MSG_DB_KEYS = sorted([
     k for k in ALL_KEYS
-    if k.startswith("message\\message_") and k.endswith(".db")
+    if k.startswith("Message/msg_") and k.endswith(".db")
     and "fts" not in k and "resource" not in k
 ])
 
@@ -266,7 +236,7 @@ MSG_DB_KEYS = sorted([
 def _find_msg_table_for_user(username):
     """在所有 message_N.db 中查找用户的消息表，返回 (db_path, table_name)"""
     table_hash = hashlib.md5(username.encode()).hexdigest()
-    table_name = f"Msg_{table_hash}"
+    table_name = f"Chat_{table_hash}"
 
     for rel_key in MSG_DB_KEYS:
         path = _cache.get(rel_key)
@@ -305,36 +275,34 @@ def get_recent_sessions(limit: int = 20) -> str:
     Args:
         limit: 返回的会话数量，默认20
     """
-    path = _cache.get("session\\session.db")
+    path = _cache.get("Session/session_new.db")
     if not path:
-        return "错误: 无法解密 session.db"
+        return "错误: 无法解密 session_new.db"
 
     names = get_contact_names()
     conn = sqlite3.connect(path)
     rows = conn.execute("""
-        SELECT username, unread_count, summary, last_timestamp,
-               last_msg_type, last_msg_sender, last_sender_display_name
-        FROM SessionTable
-        WHERE last_timestamp > 0
-        ORDER BY last_timestamp DESC
+        SELECT m_nsUserName, m_uUnReadCount, m_uLastTime, _packed_MMSessionInfo
+        FROM SessionAbstract
+        WHERE m_uLastTime > 0
+        ORDER BY m_uLastTime DESC
         LIMIT ?
     """, (limit,)).fetchall()
     conn.close()
 
     results = []
     for r in rows:
-        username, unread, summary, ts, msg_type, sender, sender_name = r
-        display = names.get(username, username)
+        username, unread, ts, blob = r
+        info = parse_session_info(blob)
+        msg_type = info['msg_type']
+        sender = info['sender']
+        summary = info['summary']
+        display = names.get(username) or info.get('display_name') or username
         is_group = '@chatroom' in username
-
-        if isinstance(summary, str) and ':\n' in summary:
-            summary = summary.split(':\n', 1)[1]
-        elif isinstance(summary, bytes):
-            summary = '(压缩内容)'
 
         sender_display = ''
         if is_group and sender:
-            sender_display = names.get(sender, sender_name or sender)
+            sender_display = names.get(sender, sender)
 
         time_str = datetime.fromtimestamp(ts).strftime('%m-%d %H:%M')
 
@@ -346,7 +314,7 @@ def get_recent_sessions(limit: int = 20) -> str:
         entry += f"\n  {format_msg_type(msg_type)}: "
         if sender_display:
             entry += f"{sender_display}: "
-        entry += str(summary or "(无内容)")
+        entry += format_summary(msg_type, summary) or "(无内容)"
 
         results.append(entry)
 
@@ -376,10 +344,9 @@ def get_chat_history(chat_name: str, limit: int = 50) -> str:
     conn = sqlite3.connect(db_path)
     try:
         rows = conn.execute(f"""
-            SELECT local_type, create_time, message_content, WCDB_CT_message_content
+            SELECT messageType, msgCreateTime, msgContent
             FROM [{table_name}]
-            WHERE WCDB_CT_message_content = 0 OR WCDB_CT_message_content IS NULL
-            ORDER BY create_time DESC
+            ORDER BY msgCreateTime DESC
             LIMIT ?
         """, (limit,)).fetchall()
     except Exception as e:
@@ -391,13 +358,12 @@ def get_chat_history(chat_name: str, limit: int = 50) -> str:
         return f"{display_name} 无消息记录"
 
     lines = []
-    for local_type, create_time, content, ct in reversed(rows):
+    for local_type, create_time, content in reversed(rows):
         time_str = datetime.fromtimestamp(create_time).strftime('%m-%d %H:%M')
         sender, text = _parse_message_content(content, local_type, is_group)
 
         if local_type != 1:
-            type_label = format_msg_type(local_type)
-            text = f"[{type_label}] {text}" if text else f"[{type_label}]"
+            text = format_summary(local_type, text)
 
         if text and len(text) > 500:
             text = text[:500] + "..."
@@ -438,9 +404,9 @@ def search_messages(keyword: str, limit: int = 20) -> str:
 
         conn = sqlite3.connect(path)
         try:
-            # 获取所有 Msg_ 表
+            # 获取所有 Chat_ 表
             tables = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'"
             ).fetchall()
 
             # 获取 Name2Id 映射（hash -> username 反查）
@@ -448,7 +414,7 @@ def search_messages(keyword: str, limit: int = 20) -> str:
             try:
                 for r in conn.execute("SELECT user_name FROM Name2Id").fetchall():
                     h = hashlib.md5(r[0].encode()).hexdigest()
-                    name2id[f"Msg_{h}"] = r[0]
+                    name2id[f"Chat_{h}"] = r[0]
             except Exception:
                 pass
 
@@ -461,11 +427,10 @@ def search_messages(keyword: str, limit: int = 20) -> str:
 
                 try:
                     rows = conn.execute(f"""
-                        SELECT local_type, create_time, message_content
+                        SELECT messageType, msgCreateTime, msgContent
                         FROM [{tname}]
-                        WHERE message_content LIKE ? AND
-                              (WCDB_CT_message_content = 0 OR WCDB_CT_message_content IS NULL)
-                        ORDER BY create_time DESC
+                        WHERE msgContent LIKE ?
+                        ORDER BY msgCreateTime DESC
                         LIMIT ?
                     """, (f'%{keyword}%', limit - len(results))).fetchall()
                 except Exception:
@@ -473,6 +438,8 @@ def search_messages(keyword: str, limit: int = 20) -> str:
 
                 for local_type, ts, content in rows:
                     sender, text = _parse_message_content(content, local_type, is_group)
+                    if local_type != 1:
+                        text = format_summary(local_type, text)
                     time_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
                     sender_name = ''
                     if is_group and sender:
@@ -545,27 +512,28 @@ def get_new_messages() -> str:
     """获取自上次调用以来的新消息。首次调用返回最近的会话状态。"""
     global _last_check_state
 
-    path = _cache.get("session\\session.db")
+    path = _cache.get("Session/session_new.db")
     if not path:
-        return "错误: 无法解密 session.db"
+        return "错误: 无法解密 session_new.db"
 
     names = get_contact_names()
     conn = sqlite3.connect(path)
     rows = conn.execute("""
-        SELECT username, unread_count, summary, last_timestamp,
-               last_msg_type, last_msg_sender, last_sender_display_name
-        FROM SessionTable
-        WHERE last_timestamp > 0
-        ORDER BY last_timestamp DESC
+        SELECT m_nsUserName, m_uUnReadCount, m_uLastTime, _packed_MMSessionInfo
+        FROM SessionAbstract
+        WHERE m_uLastTime > 0
+        ORDER BY m_uLastTime DESC
     """).fetchall()
     conn.close()
 
     curr_state = {}
     for r in rows:
-        username, unread, summary, ts, msg_type, sender, sender_name = r
+        username, unread, ts, blob = r
+        info = parse_session_info(blob)
         curr_state[username] = {
-            'unread': unread, 'summary': summary, 'timestamp': ts,
-            'msg_type': msg_type, 'sender': sender or '', 'sender_name': sender_name or '',
+            'unread': unread or 0, 'summary': info['summary'], 'timestamp': ts,
+            'msg_type': info['msg_type'], 'sender': info['sender'],
+            'display_name': info.get('display_name', ''),
         }
 
     if not _last_check_state:
@@ -574,16 +542,11 @@ def get_new_messages() -> str:
         unread_msgs = []
         for username, s in curr_state.items():
             if s['unread'] and s['unread'] > 0:
-                display = names.get(username, username)
+                display = names.get(username) or s.get('display_name') or username
                 is_group = '@chatroom' in username
-                summary = s['summary']
-                if isinstance(summary, str) and ':\n' in summary:
-                    summary = summary.split(':\n', 1)[1]
-                elif isinstance(summary, bytes):
-                    summary = '(压缩内容)'
                 time_str = datetime.fromtimestamp(s['timestamp']).strftime('%H:%M')
                 tag = "[群]" if is_group else ""
-                unread_msgs.append(f"[{time_str}] {display}{tag} ({s['unread']}条未读): {summary}")
+                unread_msgs.append(f"[{time_str}] {display}{tag} ({s['unread']}条未读): {format_summary(s['msg_type'], s['summary'])}")
 
         if unread_msgs:
             return f"当前 {len(unread_msgs)} 个未读会话:\n\n" + "\n".join(unread_msgs)
@@ -594,17 +557,12 @@ def get_new_messages() -> str:
     for username, s in curr_state.items():
         prev_ts = _last_check_state.get(username, 0)
         if s['timestamp'] > prev_ts:
-            display = names.get(username, username)
+            display = names.get(username) or s.get('display_name') or username
             is_group = '@chatroom' in username
-            summary = s['summary']
-            if isinstance(summary, str) and ':\n' in summary:
-                summary = summary.split(':\n', 1)[1]
-            elif isinstance(summary, bytes):
-                summary = '(压缩内容)'
 
             sender_display = ''
             if is_group and s['sender']:
-                sender_display = names.get(s['sender'], s['sender_name'] or s['sender'])
+                sender_display = names.get(s['sender'], s['sender'])
 
             time_str = datetime.fromtimestamp(s['timestamp']).strftime('%H:%M:%S')
             entry = f"[{time_str}] {display}"
@@ -613,7 +571,7 @@ def get_new_messages() -> str:
             entry += f": {format_msg_type(s['msg_type'])}"
             if sender_display:
                 entry += f" ({sender_display})"
-            entry += f" - {summary}"
+            entry += f" - {format_summary(s['msg_type'], s['summary'])}"
             new_msgs.append((s['timestamp'], entry))
 
     _last_check_state = {u: s['timestamp'] for u, s in curr_state.items()}

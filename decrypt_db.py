@@ -1,24 +1,22 @@
 """
-WeChat 4.0 数据库解密器
+WeChat 3.8.x (macOS) 数据库解密器
 
-使用从进程内存提取的per-DB enc_key解密SQLCipher 4加密的数据库
-参数: SQLCipher 4, AES-256-CBC, HMAC-SHA512, reserve=80, page_size=4096
-密钥来源: all_keys.json (由find_all_keys.py从内存提取)
+使用从进程内存提取的 per-DB enc_key 解密 SQLCipher 3 加密数据库
+参数: SQLCipher 3, AES-256-CBC, HMAC-SHA1, reserve=48, page_size=1024
+密钥来源: all_keys.json (由 find_all_keys.py 从内存提取)
 """
-import hashlib, struct, os, sys, json
-import hmac as hmac_mod
-from Crypto.Cipher import AES
+import os, sys, json, shutil
+import sqlite3
 
 import functools
 print = functools.partial(print, flush=True)
 
-PAGE_SZ = 4096
-KEY_SZ = 32
-SALT_SZ = 16
-IV_SZ = 16
-HMAC_SZ = 64
-RESERVE_SZ = 80  # IV(16) + HMAC(64)
-SQLITE_HDR = b'SQLite format 3\x00'
+from crypto_params import (
+    PAGE_SZ, SALT_SZ, IV_SZ, HMAC_SZ, RESERVE_SZ, KEY_SZ,
+    SQLITE_HDR, decrypt_page, derive_mac_key,
+)
+import hmac as hmac_mod
+import hashlib, struct
 
 from config import load_config
 _cfg = load_config()
@@ -27,32 +25,7 @@ OUT_DIR = _cfg["decrypted_dir"]
 KEYS_FILE = _cfg["keys_file"]
 
 
-def derive_mac_key(enc_key, salt):
-    """从enc_key派生HMAC密钥"""
-    mac_salt = bytes(b ^ 0x3a for b in salt)
-    return hashlib.pbkdf2_hmac("sha512", enc_key, mac_salt, 2, dklen=KEY_SZ)
-
-
-def decrypt_page(enc_key, page_data, pgno):
-    """解密单个页面，输出4096字节的标准SQLite页面"""
-    iv = page_data[PAGE_SZ - RESERVE_SZ : PAGE_SZ - RESERVE_SZ + IV_SZ]
-
-    if pgno == 1:
-        encrypted = page_data[SALT_SZ : PAGE_SZ - RESERVE_SZ]
-        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
-        page = bytearray(SQLITE_HDR + decrypted + b'\x00' * RESERVE_SZ)
-        # 保留 reserve=80, B-tree 基于 usable_size=4016 构建
-        return bytes(page)
-    else:
-        encrypted = page_data[:PAGE_SZ - RESERVE_SZ]
-        cipher = AES.new(enc_key, AES.MODE_CBC, iv)
-        decrypted = cipher.decrypt(encrypted)
-        return decrypted + b'\x00' * RESERVE_SZ
-
-
 def decrypt_database(db_path, out_path, enc_key):
-    """解密整个数据库文件"""
     file_size = os.path.getsize(db_path)
     total_pages = file_size // PAGE_SZ
 
@@ -67,20 +40,18 @@ def decrypt_database(db_path, out_path, enc_key):
         print(f"  [ERROR] 文件太小")
         return False
 
-    # 提取salt并派生mac_key, 验证page 1
     salt = page1[:SALT_SZ]
     mac_key = derive_mac_key(enc_key, salt)
-    p1_hmac_data = page1[SALT_SZ : PAGE_SZ - RESERVE_SZ + IV_SZ]
-    p1_stored_hmac = page1[PAGE_SZ - HMAC_SZ : PAGE_SZ]
-    hm = hmac_mod.new(mac_key, p1_hmac_data, hashlib.sha512)
-    hm.update(struct.pack('<I', 1))
-    if hm.digest() != p1_stored_hmac:
-        print(f"  [ERROR] Page 1 HMAC验证失败! salt: {salt.hex()}")
+    hmac_data = page1[SALT_SZ : PAGE_SZ - RESERVE_SZ + IV_SZ]
+    stored_hmac = page1[PAGE_SZ - RESERVE_SZ + IV_SZ : PAGE_SZ - RESERVE_SZ + IV_SZ + HMAC_SZ]
+    h = hmac_mod.new(mac_key, hmac_data, hashlib.sha1)
+    h.update(struct.pack('<I', 1))
+    if h.digest() != stored_hmac:
+        print(f"  [ERROR] Page 1 HMAC 验证失败! salt: {salt.hex()}")
         return False
 
     print(f"  HMAC OK, {total_pages} pages")
 
-    # 解密所有页面
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(db_path, 'rb') as fin, open(out_path, 'wb') as fout:
         for pgno in range(1, total_pages + 1):
@@ -94,9 +65,8 @@ def decrypt_database(db_path, out_path, enc_key):
             decrypted = decrypt_page(enc_key, page, pgno)
             fout.write(decrypted)
 
-            if pgno == 1:
-                if decrypted[:16] != SQLITE_HDR:
-                    print(f"  [WARN] 解密后header不匹配!")
+            if pgno == 1 and decrypted[:16] != SQLITE_HDR:
+                print(f"  [WARN] 解密后 header 不匹配!")
 
             if pgno % 10000 == 0:
                 print(f"  进度: {pgno}/{total_pages} ({100*pgno/total_pages:.1f}%)")
@@ -106,10 +76,9 @@ def decrypt_database(db_path, out_path, enc_key):
 
 def main():
     print("=" * 60)
-    print("  WeChat 4.0 数据库解密器")
+    print("  WeChat 3.8.x (macOS) 数据库解密器")
     print("=" * 60)
 
-    # 加载密钥
     if not os.path.exists(KEYS_FILE):
         print(f"[ERROR] 密钥文件不存在: {KEYS_FILE}")
         print("请先运行 find_all_keys.py")
@@ -122,7 +91,6 @@ def main():
     print(f"输出目录: {OUT_DIR}")
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    # 收集所有DB文件
     db_files = []
     for root, dirs, files in os.walk(DB_DIR):
         for f in files:
@@ -132,8 +100,7 @@ def main():
                 sz = os.path.getsize(path)
                 db_files.append((rel, path, sz))
 
-    db_files.sort(key=lambda x: x[2])  # 从小到大
-
+    db_files.sort(key=lambda x: x[2])
     print(f"找到 {len(db_files)} 个数据库文件\n")
 
     success = 0
@@ -141,23 +108,31 @@ def main():
     total_bytes = 0
 
     for rel, path, sz in db_files:
-        # 用反斜杠格式查找key (json中的key是Windows路径)
-        rel_key = rel.replace('/', '\\')
-        if rel_key not in keys:
-            print(f"SKIP: {rel} (无密钥)")
-            failed += 1
+        out_path = os.path.join(OUT_DIR, rel)
+
+        if rel not in keys:
+            # 检查是否明文 SQLite
+            with open(path, 'rb') as f:
+                hdr = f.read(16)
+            if hdr == SQLITE_HDR:
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                shutil.copy2(path, out_path)
+                print(f"COPY: {rel} (明文SQLite)")
+                success += 1
+                total_bytes += sz
+            else:
+                print(f"SKIP: {rel} (无密钥)")
+                failed += 1
             continue
 
-        enc_key = bytes.fromhex(keys[rel_key]["enc_key"])
+        enc_key = bytes.fromhex(keys[rel]["enc_key"])
         out_path = os.path.join(OUT_DIR, rel)
 
         print(f"解密: {rel} ({sz/1024/1024:.1f}MB) ...", end=" ")
 
         ok = decrypt_database(path, out_path, enc_key)
         if ok:
-            # SQLite验证
             try:
-                import sqlite3
                 conn = sqlite3.connect(out_path)
                 tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
                 conn.close()
@@ -169,7 +144,7 @@ def main():
                 success += 1
                 total_bytes += sz
             except Exception as e:
-                print(f"  [WARN] SQLite验证失败: {e}")
+                print(f"  [WARN] SQLite 验证失败: {e}")
                 failed += 1
         else:
             failed += 1

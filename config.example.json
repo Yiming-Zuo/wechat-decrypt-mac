@@ -1,6 +1,6 @@
 {
-    "db_dir": "D:\\xwechat_files\\your_wxid\\db_storage",
+    "db_dir": "~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application Support/com.tencent.xinWeChat/2.0b4.0.9/<user_hash>",
     "keys_file": "all_keys.json",
     "decrypted_dir": "decrypted",
-    "wechat_process": "Weixin.exe"
+    "wechat_process": "WeChat"
 }
