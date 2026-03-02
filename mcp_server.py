@@ -81,6 +81,7 @@ atexit.register(_cache.cleanup)
 _contact_names = None  # {username: display_name}
 _contact_full = None   # [{username, nick_name, remark}]
 _session_names = None  # {username: display_name} from Session protobuf
+_hash2username = None  # {Chat_<md5>: username} 反查映射
 
 
 def _load_contacts_from(db_path):
@@ -172,6 +173,36 @@ def _get_session_names():
     finally:
         conn.close()
     return _session_names
+
+
+def _build_hash2username():
+    """聚合所有已知 username，構建 Chat_<md5> → username 反查映射"""
+    global _hash2username
+    if _hash2username is not None:
+        return _hash2username
+
+    usernames = set()
+    sources = [
+        ("Contact/wccontact_new2.db", "SELECT m_nsUsrName FROM WCContact"),
+        ("Group/group_new.db", "SELECT m_nsUsrName FROM GroupMember"),
+        ("Group/group_new.db", "SELECT m_nsUsrName FROM GroupContact"),
+        ("Session/session_new.db", "SELECT m_nsUserName FROM SessionAbstract"),
+        ("Session/session_new.db", "SELECT m_nsUserName FROM SessionAbstractBrand"),
+    ]
+    for rel, sql in sources:
+        pre = os.path.join(DECRYPTED_DIR, rel)
+        db = pre if os.path.exists(pre) else _cache.get(rel)
+        if not db:
+            continue
+        try:
+            conn = sqlite3.connect(db)
+            usernames |= {r[0] for r in conn.execute(sql).fetchall() if r[0]}
+            conn.close()
+        except Exception:
+            pass
+
+    _hash2username = {f"Chat_{hashlib.md5(u.encode()).hexdigest()}": u for u in usernames}
+    return _hash2username
 
 
 def resolve_username(chat_name):
@@ -371,12 +402,10 @@ def search_messages(keyword: str, limit: int = 20) -> str:
         return json.dumps({"error": "请提供搜索关键词"}, ensure_ascii=False)
 
     names = get_contact_names()
+    hash2u = _build_hash2username()
     results = []
 
     for rel_key in MSG_DB_KEYS:
-        if len(results) >= limit:
-            break
-
         path = _cache.get(rel_key)
         if not path:
             continue
@@ -384,21 +413,11 @@ def search_messages(keyword: str, limit: int = 20) -> str:
         conn = sqlite3.connect(path)
         try:
             tables = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%'"
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Chat_%' AND name NOT LIKE '%_dels'"
             ).fetchall()
 
-            name2id = {}
-            try:
-                for r in conn.execute("SELECT user_name FROM Name2Id").fetchall():
-                    h = hashlib.md5(r[0].encode()).hexdigest()
-                    name2id[f"Chat_{h}"] = r[0]
-            except Exception:
-                pass
-
             for (tname,) in tables:
-                if len(results) >= limit:
-                    break
-                username = name2id.get(tname, '')
+                username = hash2u.get(tname, '')
                 is_group = '@chatroom' in username
                 display = names.get(username, username) if username else tname
 
@@ -406,10 +425,10 @@ def search_messages(keyword: str, limit: int = 20) -> str:
                     rows = conn.execute(f"""
                         SELECT messageType, msgCreateTime, msgContent, mesDes
                         FROM [{tname}]
-                        WHERE msgContent LIKE ?
+                        WHERE typeof(msgContent) = 'text' AND msgContent LIKE ?
                         ORDER BY msgCreateTime DESC
                         LIMIT ?
-                    """, (f'%{keyword}%', limit - len(results))).fetchall()
+                    """, (f'%{keyword}%', limit)).fetchall()
                 except Exception:
                     continue
 
